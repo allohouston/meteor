@@ -18,7 +18,7 @@ Starting with Meteor 3.4
 Add this Atmosphere package to your app:
 
 ``` bash
-meteor add rspack@1.0.0-rc340.2
+meteor add rspack@1.0.0
 ```
 
 On first run, the package installs the required Rspack setup at the project level. It compiles your app code with Rspack to get the full benefit of this integration.
@@ -779,6 +779,24 @@ module.exports = defineConfig(Meteor => ({
     ]),
 }));
 ```
+
+### Docker
+
+When running a Meteor app inside Docker using a Dockerfile that calls `meteor build`, `meteor deploy`, or `meteor run`, you may need an extra step before installing dependencies.
+
+In some setups, it’s recommended to run `meteor update --npm` before `meteor npm install`.
+
+This command checks that the NPM dependencies expected by the Meteor tool meet the minimum supported versions. Each Meteor release requires specific minimum versions of tools like Rspack and other NPM packages. Running this ensures your project aligns with the Meteor version in use, helping avoid build and deploy issues.
+
+If you encounter an error like `Rspack plugin error: Could not find rspack.config.js`, it’s often a sign that this step is missing.
+
+A typical Docker step would look like this:
+
+```dockerfile
+RUN (meteor update --npm 2>/dev/null || true) && meteor npm install && meteor build [...]
+```
+
+The `(meteor update --npm 2>/dev/null || true)` part is added for compatibility. The `--npm` option was introduced in Meteor 3.4. Older Meteor versions don’t support it and would fail. Redirecting the error and allowing the command to continue ensures the same Docker step works across versions, without breaking deployments on older Meteor releases.
 
 ## Benefits
 
