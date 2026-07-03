@@ -23,6 +23,7 @@ import { requestGarbageCollection } from "../utils/gc.js";
 import { Unibuild } from "./unibuild.js";
 import rspackHelpers from "../tool-env/rspack";
 import { getCurrentNodeBinDir, getDevBundle } from "../fs/files";
+import { runLogInstance } from "../runners/run-log";
 
 var rejectBadPath = function (p) {
   if (p.match(/\.\./)) {
@@ -58,6 +59,7 @@ var Isopack = function () {
   self.debugOnly = false;
   self.prodOnly = false;
   self.testOnly = false;
+  self.devOnly = false;
 
   // Unibuilds, an array of class Unibuild.
   self.unibuilds = [];
@@ -269,6 +271,7 @@ Object.assign(Isopack.prototype, {
     self.debugOnly = options.debugOnly;
     self.prodOnly = options.prodOnly;
     self.testOnly = options.testOnly;
+    self.devOnly = options.devOnly;
     self.pluginCacheDir = options.pluginCacheDir || null;
     self.isobuildFeatures = options.isobuildFeatures;
   },
@@ -527,6 +530,9 @@ Object.assign(Isopack.prototype, {
 
       // Share the rspackHelpers as part of plugin API
       rspackHelpers,
+
+      // Share the runLogInstance as part of plugin API
+      runLogInstance,
 
       // 'extension' is a file extension without the separation dot
       // (eg 'js', 'coffee', 'coffee.md')
@@ -918,6 +924,7 @@ Object.assign(Isopack.prototype, {
       self.debugOnly = !!mainJson.debugOnly;
       self.prodOnly = !!mainJson.prodOnly;
       self.testOnly = !!mainJson.testOnly;
+      self.devOnly = !!mainJson.devOnly;
     }
     for (const pluginMeta of mainJson.plugins) {
       rejectBadPath(pluginMeta.path);
@@ -1068,6 +1075,9 @@ Object.assign(Isopack.prototype, {
       }
       if (self.testOnly) {
         mainJson.testOnly = true;
+      }
+      if (self.devOnly) {
+        mainJson.devOnly = true;
       }
       if (! _.isEmpty(self.cordovaDependencies)) {
         mainJson.cordovaDependencies = self.cordovaDependencies;

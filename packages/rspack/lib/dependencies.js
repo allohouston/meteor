@@ -19,6 +19,7 @@ const {
   logError,
 } = require('meteor/tools-core/lib/log');
 const {
+  isMeteorAppUpdate,
   getMeteorAppDir,
 } = require('meteor/tools-core/lib/meteor');
 const {
@@ -68,17 +69,17 @@ async function ensureDependenciesInstalled(dependencies, globalStateKey, package
   const dependencyStrings = allDepsToInstall.map(dep => `${dep.name}@${dep.version}`);
 
   if (allDepsToInstall.length > 0) {
-    let success = true;
+    let devDepsSuccess = true;
+    let regularDepsSuccess = true;
+    let devDepsStrings = [];
+    let regularDepsStrings = [];
 
     // Display a header for the installation process
-    logProgress(`┌─────────────────────────────────────────────────`);
-    logProgress(`│ ${packageName} Dependencies Installation`);
-    logProgress(`└─────────────────────────────────────────────────`);
+    logProgress(`=> 📦 ${packageName} Dependencies`);
 
     // Show what dependencies will be installed
-    logInfo(`The following ${packageName} dependencies need to be installed:`);
     dependencyStrings.forEach(dep => {
-      logInfo(`  • ${dep}`);
+      logInfo(`   • ${dep}`);
     });
 
     // Check if this is a Yarn project
@@ -87,16 +88,16 @@ async function ensureDependenciesInstalled(dependencies, globalStateKey, package
     // Install dev dependencies
     const devDepsToInstall = allDepsToInstall.filter(dep => dep.dev === true || dep.dev == null);
     if (devDepsToInstall.length > 0) {
-      const devDepsStrings = devDepsToInstall.map(dep => `${dep.name}@${dep.version}`);
+      devDepsStrings = devDepsToInstall.map(dep => `${dep.name}@${dep.version}`);
 
       // Log progress for dev dependencies
       logProgress(
-        `🔧 Installing ${devDepsToInstall.length} dev dependenc${
+        `=> 🔧 Installing ${devDepsToInstall.length} dev dependenc${
           devDepsToInstall.length === 1 ? "y" : "ies"
         }...`
       );
 
-      success = await installNpmDependency(devDepsStrings, {
+      devDepsSuccess = await installNpmDependency(devDepsStrings, {
         cwd: appDir,
         dev: true,
         yarn: isYarnProj,
@@ -104,44 +105,63 @@ async function ensureDependenciesInstalled(dependencies, globalStateKey, package
     }
 
     // Install regular dependencies
-    const depsToInstall = allDepsToInstall.filter(dep => dep.dev === false);
-    if (depsToInstall.length > 0) {
-      const depsStrings = depsToInstall.map(dep => `${dep.name}@${dep.version}`);
+    const regularDepsToInstall = allDepsToInstall.filter(dep => dep.dev === false);
+    if (regularDepsToInstall.length > 0) {
+      regularDepsStrings = regularDepsToInstall.map(dep => `${dep.name}@${dep.version}`);
 
       // Log progress for regular dependencies
       logProgress(
-        `🔧 Installing ${depsToInstall.length} dependenc${
-          devDepsToInstall.length === 1 ? "y" : "ies"
+        `=> 🔧 Installing ${regularDepsToInstall.length} dependenc${
+          regularDepsToInstall.length === 1 ? "y" : "ies"
         }...`
       );
 
-      let depsSuccess;
-      depsSuccess = await installNpmDependency(depsStrings, {
+      regularDepsSuccess = await installNpmDependency(regularDepsStrings, {
         cwd: appDir,
         dev: false,
         yarn: isYarnProj,
       });
-
-      success = success && depsSuccess;
     }
+
+    const success = devDepsSuccess && regularDepsSuccess;
 
     if (!success) {
       const isYarnProj = process.env.YARN_ENABLED === 'true';
-      const installCommand = isYarnProj 
-        ? `yarn add --dev ${dependencyStrings.join(' ').trim()}`
-        : `meteor npm install -D ${dependencyStrings.join(' ').trim()}`;
 
-      logError(`\n┌─────────────────────────────────────────────────`);
-      logError(`│ ❌ ${packageName} Installation Failed`);
-      logError(`└─────────────────────────────────────────────────`);
-      logError(`Run: ${installCommand}`);
+      logError(`=> ❌ Failed to install ${packageName}`);
+
+      if (!devDepsSuccess && devDepsStrings.length > 0) {
+        const devInstallCommand = isYarnProj 
+          ? `yarn add --dev ${devDepsStrings.join(' ').trim()}`
+          : `meteor npm install -D ${devDepsStrings.join(' ').trim()}`;
+        logError(`   For dev dependencies, run: ${devInstallCommand}`);
+      }
+
+      if (!regularDepsSuccess && regularDepsStrings.length > 0) {
+        const regularInstallCommand = isYarnProj 
+          ? `yarn add ${regularDepsStrings.join(' ').trim()}`
+          : `meteor npm install ${regularDepsStrings.join(' ').trim()}`;
+        logError(`   For regular dependencies, run: ${regularInstallCommand}`);
+      }
+
+      const allFailedDeps = [];
+      if (!devDepsSuccess) allFailedDeps.push('dev dependencies');
+      if (!regularDepsSuccess) allFailedDeps.push('regular dependencies');
 
       throw new Error(
-        `Failed to install ${packageName} dependencies. Please install them manually with: ${installCommand}`
+        `Failed to install ${packageName} ${joinWithAnd(allFailedDeps)}. Please install them manually with the commands above.`
       );
     }
 
-    logSuccess(`✅ ${packageName} dependencies installed`);
+    logSuccess(`=> ✅ Installed ${packageName} dependencies`);
+
+    if (isMeteorAppUpdate()) {
+      const isYarnProj = process.env.YARN_ENABLED === 'true';
+      const installCommand = isYarnProj ? 'yarn install' : 'npm install';
+
+      logInfo(`=> 🔔 Remember: Run \`${installCommand}\` after the Meteor update finishes.`);
+      logInfo(`   This helps keep your dependencies correct and your project stable.`);
+    }
   }
 
   // Mark as checked
@@ -182,7 +202,7 @@ export function checkReactInstalled() {
 
   const appDir = getMeteorAppDir();
   // Check if React is a dependency in the project
-  const isReactInstalled = checkNpmDependencyExists('react', { cwd: appDir });
+  const isReactInstalled = checkNpmDependencyExists('react', { cwd: appDir }) && !checkNpmDependencyExists('preact', { cwd: appDir });
 
   if (isReactInstalled) {
     // Set environment variable to indicate React is enabled
@@ -253,4 +273,32 @@ export function checkTypescriptInstalled() {
   setGlobalState(GLOBAL_STATE_KEYS.TYPESCRIPT_CHECKED, true);
 
   return isTypescriptInstalled;
+}
+
+/**
+ * Checks if Angular is installed and sets global state accordingly
+ * Sets global state and environment variables based on Angular detection
+ * @returns {boolean} Whether Angular is installed
+ */
+export function checkAngularInstalled() {
+  // Skip if already checked
+  if (getGlobalState(GLOBAL_STATE_KEYS.ANGULAR_CHECKED, false)) {
+    return;
+  }
+
+  const appDir = getMeteorAppDir();
+  // Check if @nx/angular-rspack is a dependency in the project
+  const isAngularInstalled = checkNpmDependencyExists('@nx/angular-rspack', { cwd: appDir });
+
+  if (isAngularInstalled) {
+    // Set environment variable to indicate Angular is enabled
+    process.env.METEOR_ANGULAR_ENABLED = 'true';
+  } else {
+    process.env.METEOR_ANGULAR_ENABLED = 'false';
+  }
+
+  // Mark as checked
+  setGlobalState(GLOBAL_STATE_KEYS.ANGULAR_CHECKED, true);
+
+  return isAngularInstalled;
 }

@@ -328,6 +328,9 @@ var PackageSource = function () {
   // as a string.
   self.npmDependencies = {};
 
+  // npm packages used for development of this package.
+  self.npmDevDependencies = {};
+
   // Files to be stripped from the installed NPM dependency tree. See the
   // Npm.strip comment below for further usage information.
   self.npmDiscards = null;
@@ -438,6 +441,9 @@ Object.assign(PackageSource.prototype, {
     utils.ensureOnlyValidVersions(options.npmDependencies, {forCordova: false});
     self.npmDependencies = options.npmDependencies;
 
+    utils.ensureOnlyValidVersions(options.npmDevDependencies, {forCordova: false});
+    self.npmDevDependencies = options.npmDevDependencies;
+
     // If options.npmDir is a string, make sure it contains no colons.
     self.npmCacheDirectory = _.isString(options.npmDir)
       ? convertColonsInPath(options.npmDir)
@@ -494,6 +500,9 @@ Object.assign(PackageSource.prototype, {
   // - name: override the name of this package with a different name.
   // - buildingIsopackets: true if this is being scanned in the process
   //   of building isopackets
+  // - buildingSelfTestCatalog: true if this is being scanned by
+  //   newSelfTestCatalog. Causes versionsFrom() to no-op so the scan
+  //   does not depend on catalog.official being warm.
   initFromPackageDir: Profile((dir, options) => {
     return `PackageSource#initFromPackageDir for ${
       options?.name || dir.split(files.pathSep).pop()
@@ -658,7 +667,8 @@ Object.assign(PackageSource.prototype, {
     // exist in the field, if not every single one. #OldStylePackageSupport
 
     var api = new PackageAPI({
-      buildingIsopackets: !! initFromPackageDirOptions.buildingIsopackets
+      buildingIsopackets: !! initFromPackageDirOptions.buildingIsopackets,
+      buildingSelfTestCatalog: !! initFromPackageDirOptions.buildingSelfTestCatalog,
     });
 
     if (Package._fileAndDepLoader) {
@@ -772,7 +782,10 @@ Object.assign(PackageSource.prototype, {
     // dirs for use vs test?
     self.npmCacheDirectory =
       files.pathResolve(files.pathJoin(self.sourceRoot, '.npm', 'package'));
+    self.npmDevCacheDirectory =
+        files.pathResolve(files.pathJoin(self.sourceRoot, '.npm', 'devPackage'));
     self.npmDependencies = Npm._dependencies;
+    self.npmDevDependencies = Npm._devDependencies;
     self.npmDiscards = Npm._discards;
 
     self.cordovaDependencies = Cordova._dependencies;
