@@ -1,6 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 
+const { logError } = require("./log");
+
+// Normalize a path to always use forward slashes (POSIX style).
+// Module identifiers must use '/' regardless of OS.
+const toPosix = (p) => p.replace(/\\/g, '/');
+
 /**
  * Returns the current working directory of the Meteor application.
  * @returns {string} The absolute path to the Meteor application directory.
@@ -86,24 +92,51 @@ export function getMeteorAppEntrypoints() {
  * Retrieves the initial entry points for the Meteor application from the package.json.
  * @returns {Object} An object containing the main and test entry points for client and server.
  * @returns {string|undefined} mainClient - The client main module path.
+ * @returns {string|undefined} mainClientHtml - The client main html path.
  * @returns {string|undefined} mainServer - The server main module path.
  * @returns {string|undefined} testClient - The client test module path.
  * @returns {string|undefined} testServer - The server test module path.
  */
 export function getMeteorInitialAppEntrypoints() {
   const meteorConfig = getMeteorAppPackageJson()?.meteor;
+  const mainClient = meteorConfig?.mainModule?.client;
+
+  let mainClientHtml;
+  if (mainClient) {
+    const clientDir = path.dirname(mainClient);
+    const clientBasename = path.basename(mainClient, path.extname(mainClient));
+    const htmlPath = path.join(
+      getMeteorAppDir(),
+      clientDir,
+      `${clientBasename}.html`
+    );
+
+    if (fs.existsSync(htmlPath)) {
+      mainClientHtml = toPosix(path.join(clientDir, `${clientBasename}.html`));
+    } else {
+      // Find first html in entry folder
+      const files = fs.readdirSync(path.join(getMeteorAppDir(), clientDir));
+      const htmlFile = files.find((file) => path.extname(file) === ".html");
+      if (htmlFile) {
+        mainClientHtml = toPosix(path.join(clientDir, htmlFile));
+      }
+    }
+  }
+
   return {
-    mainClient: meteorConfig?.mainModule?.client,
+    mainClient,
+    mainClientHtml,
     mainServer: meteorConfig?.mainModule?.server,
-    ...meteorConfig?.testModule?.client && {
+    ...(meteorConfig?.testModule?.client && {
       testClient: meteorConfig?.testModule?.client,
-    },
-    ...meteorConfig?.testModule?.server && {
+    }),
+    ...(meteorConfig?.testModule?.server && {
       testServer: meteorConfig?.testModule?.server,
-    },
-    ...!meteorConfig?.testModule?.client && !meteorConfig?.testModule?.server && {
-      testModule: meteorConfig?.testModule,
-    },
+    }),
+    ...(!meteorConfig?.testModule?.client &&
+      !meteorConfig?.testModule?.server && {
+        testModule: meteorConfig?.testModule,
+      }),
   };
 }
 
@@ -176,6 +209,14 @@ export function isMeteorAppBuild() {
 }
 
 /**
+ * Checks if the current Meteor command is 'update'.
+ * @returns {boolean} True if the current command is 'update', false otherwise.
+ */
+export function isMeteorAppUpdate() {
+  return Package?.meteor?.global?.currentCommand?.name === 'update';
+}
+
+/**
  * Checks if the current Meteor command is 'test'.
  * @returns {boolean} True if the current command is 'test', false otherwise.
  */
@@ -232,6 +273,9 @@ export function isMeteorAppNative() {
  * @returns {boolean} True if the application is in development mode, false otherwise.
  */
 export function isMeteorAppDevelopment() {
+  if (process.env.NODE_ENV) {
+    return process.env.NODE_ENV !== 'production';
+  }
   return Package.meteor?.Meteor.isDevelopment && !isMeteorAppBuild();
 }
 
@@ -240,6 +284,9 @@ export function isMeteorAppDevelopment() {
  * @returns {boolean} True if the application is in production mode, false otherwise.
  */
 export function isMeteorAppProduction() {
+  if (process.env.NODE_ENV) {
+    return process.env.NODE_ENV === 'production';
+  }
   return Package.meteor?.Meteor.isProduction || isMeteorAppBuild();
 }
 
@@ -255,6 +302,14 @@ export function isMeteorAppDebug() {
       return ['inspect', 'debug', 'brk'].includes(_arg);
     })
   );
+}
+
+/**
+ * Checks if the Meteor application is running with METEOR_PROFILE enabled.
+ * @returns {boolean} True if METEOR_PROFILE is set, false otherwise.
+ */
+export function isMeteorAppProfile() {
+  return !!process.env.METEOR_PROFILE;
 }
 
 /**
@@ -348,11 +403,11 @@ export function getMeteorAppFilesAndFolders(options = {}) {
           }
         } catch (error) {
           // Skip items that can't be accessed
-          console.error(`Error accessing ${itemPath}: ${error.message}`);
+          logError(`=> Failed to access ${itemPath}: ${error.message}`);
         }
       }
     } catch (error) {
-      console.error(`Error reading directory ${dirPath}: ${error.message}`);
+      logError(`=> Failed to read directory ${dirPath}: ${error.message}`);
     }
 
     return result;
@@ -451,4 +506,37 @@ export function getMeteorEnvPackageDirs() {
     // PACKAGE_DIRS (deprecated) always used ':' separator (yes, even Windows)
     ...(packageDirsFromEnvVar('PACKAGE_DIRS', ':')),
   ];
+}
+
+/**
+ * Spreads Meteor's TOOL_NODE_FLAGS to NODE_OPTIONS for proper inheritance
+ * of Meteor-specific tool environment process variables.
+ * Only spreads if TOOL_NODE_FLAGS_INHERIT is truthy (enabled by default).
+ * @param {Object} env - The current environment variables
+ * @returns {Object} The updated environment variables with NODE_OPTIONS
+ */
+export function inheritMeteorToolNodeFlags(env = {}) {
+  const toolFlags = env.TOOL_NODE_FLAGS;
+  if (!toolFlags) {
+    return env;
+  }
+
+  // Check if spreading is enabled (default: true)
+  // Only disable if TOOL_NODE_FLAGS_INHERIT is explicitly set to a falsy value
+  // Treat "0" as falsy for this specific case
+  const shouldSpread = env.TOOL_NODE_FLAGS_INHERIT !== undefined 
+    ? (env.TOOL_NODE_FLAGS_INHERIT !== "0" && !!env.TOOL_NODE_FLAGS_INHERIT)
+    : true;
+
+  if (!shouldSpread) {
+    return env;
+  }
+
+  return {
+    ...env,
+    NODE_OPTIONS: [toolFlags, env.NODE_OPTIONS]
+      .filter(Boolean)
+      .map(s => s.trim())
+      .join(' '),
+  };
 }

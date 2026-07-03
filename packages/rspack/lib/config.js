@@ -15,8 +15,10 @@ const {
   isMeteorAppDevelopment,
   isMeteorAppRun,
   isMeteorAppBuild,
+  isMeteorAppNative,
   isMeteorAppDebug,
   isMeteorAppTest,
+  isMeteorAppTestFullApp,
   isMeteorAppConfigModernVerbose,
   isMeteorBlazeProject,
   isMeteorLessProject,
@@ -154,7 +156,9 @@ export function configureMeteorForRspack() {
   const initialEntrypointContexts = [
     initialEntrypoints.mainClient,
     initialEntrypoints.mainServer,
-  ].map(entrypoint => path.dirname(entrypoint));
+  ]
+    .filter(Boolean)
+    .map(entrypoint => path.dirname(entrypoint));
   const includedDirs = ['public', 'private', '.meteor', RSPACK_BUILD_CONTEXT];
   const ignoredDirs = projectRootFilesAndFolders.directories.filter(
     dir => !includedDirs.includes(dir),
@@ -318,17 +322,18 @@ export function configureMeteorForRspack() {
     ...commandRole,
     isServer: true,
   });
-  const testClientModule = getBuildFilePath({
-    isTest: true,
-    ...env,
-    ...commandRole,
-    isClient: true,
-  });
   const isTestEager =
     initialEntrypoints.testModule == null &&
     initialEntrypoints.testClient == null &&
     initialEntrypoints.testServer == null;
   const isTestModule = initialEntrypoints.testModule != null || isTestEager;
+  const testClientModule = getBuildFilePath({
+    isTest: true,
+    ...env,
+    ...commandRole,
+    isTestModule,
+    isClient: true,
+  });
   const testServerModule = getBuildFilePath({
     isTest: true,
     ...env,
@@ -337,16 +342,24 @@ export function configureMeteorForRspack() {
     isServer: true,
   });
 
-  const appEntrypoints = {
+  let appEntrypoints = {
     mainClient: `${RSPACK_BUILD_CONTEXT}/${mainClientModule}`,
     mainServer: `${RSPACK_BUILD_CONTEXT}/${mainServerModule}`,
     ...((isTestModule && {
-      testModule: `${RSPACK_BUILD_CONTEXT}/${testServerModule}`,
+      testClient: `${RSPACK_BUILD_CONTEXT}/${testClientModule}`,
+      testServer: `${RSPACK_BUILD_CONTEXT}/${testServerModule}`,
     }) || {
       testClient: `${RSPACK_BUILD_CONTEXT}/${testClientModule}`,
       testServer: `${RSPACK_BUILD_CONTEXT}/${testServerModule}`,
     }),
   };
+  if (isMeteorAppTestFullApp()) {
+    appEntrypoints = {
+      ...appEntrypoints,
+      mainClient: `${RSPACK_BUILD_CONTEXT}/${testClientModule}`,
+      mainServer: `${RSPACK_BUILD_CONTEXT}/${testServerModule}`,
+    };
+  }
   // Set entry points in environment variables if they exist
   setMeteorAppEntrypoints(appEntrypoints);
 
@@ -358,7 +371,7 @@ export function configureMeteorForRspack() {
   ensureModuleFilesExist();
 
   // Write content to module files
-  if (isMeteorAppRun() && isMeteorAppDevelopment()) {
+  if (isMeteorAppRun() && isMeteorAppDevelopment() && !isMeteorAppNative()) {
     const customScriptUrl = `/__rspack__/${getBuildFilePath({
       ...env,
       isMain: true,
@@ -370,6 +383,55 @@ export function configureMeteorForRspack() {
 
     if (isMeteorAppDebug() || isMeteorAppConfigModernVerbose()) {
       logInfo(`[i] App custom script: ${customScriptUrl}`);
+    }
+  }
+}
+
+/**
+ * Applies delegated extension ignore patterns for entry folder files.
+ * Called after rspack's first compilation reports which extensions it handles.
+ * Since Meteor awaits rspack compilation before scanning files, these patterns
+ * are in place before Meteor processes any application files.
+ *
+ * Uses gitignore semantics: a later positive pattern (client/*.css) overrides
+ * an earlier negation (!client/*.css) that was set in configureMeteorForRspack.
+ *
+ * @param {string[]} extensions - Array of extensions like ['.css', '.less']
+ */
+export function applyDelegatedExtensions(extensions) {
+  if (!extensions || extensions.length === 0) return;
+
+  const initialEntrypoints = getInitialEntrypoints();
+  const entrypointContexts = [
+    initialEntrypoints.mainClient,
+    initialEntrypoints.mainServer,
+  ]
+    .filter(Boolean)
+    .map(entrypoint => path.dirname(entrypoint));
+
+  const ignorePatterns = [];
+  for (const dir of entrypointContexts) {
+    for (const ext of extensions) {
+      // ext comes as '.css', glob needs '*.css'
+      ignorePatterns.push(`${dir}/*${ext}`);
+    }
+  }
+
+  if (ignorePatterns.length > 0) {
+    // Re-append meteor.modules unignore patterns after the delegation ignores
+    // so they take precedence (gitignore semantics: last match wins)
+    const meteorAppConfig = getMeteorAppConfig();
+    const unignoredFilesAndFolders = buildUnignorePatterns(
+      meteorAppConfig?.modules || [],
+      { skipLevel: 1 },
+    );
+
+    setMeteorAppIgnore(
+      [...ignorePatterns, ...unignoredFilesAndFolders].join(' ')
+    );
+
+    if (isMeteorAppDebug() || isMeteorAppConfigModernVerbose()) {
+      logInfo(`[i] Rspack delegated extensions: ${extensions.join(', ')} (ignored in entry folders)\n    ${process.env.METEOR_IGNORE}`);
     }
   }
 }

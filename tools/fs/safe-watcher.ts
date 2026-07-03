@@ -5,6 +5,7 @@ import { watch as watchLegacy, addWatchRoot as addWatchRootLegacy, closeAllWatch
 import { Profile } from "../tool-env/profile";
 import { statOrNull, lstat, toPosixPath, convertToOSPath, pathRelative, watchFile, unwatchFile, pathResolve, pathDirname } from "./files";
 import { getMeteorConfig } from "../tool-env/meteor-config";
+import { shouldIgnorePathFromMeteorIgnore } from "./optimistic";
 
 // Register process exit handlers to ensure subscriptions are properly cleaned up
 const registerExitHandlers = () => {
@@ -182,6 +183,10 @@ function shouldIgnorePath(absPath: string): boolean {
       }
       return true;
     } else {
+      // Check if the path matches any .meteorignore patterns
+      if (shouldIgnorePathFromMeteorIgnore(absPath)) {
+        return true;
+      }
       // Otherwise, don't ignore non-npm node_modules
       return false;
     }
@@ -312,9 +317,13 @@ async function ensureWatchRoot(dirPath: string): Promise<void> {
             if (/Events were dropped/.test(err.message)) {
               return;
             }
+            if (/RootResolveError/.test(err.message) || /failed to resolve root/.test(err.message)) {
+              console.warn(`Parcel watcher root resolve error on ${osDirPath}, ignoring: ${err.message}`);
+              ignoredWatchRoots.add(dirPath);
+              watchRoots.delete(dirPath);
+              return;
+            }
             console.error(`Parcel watcher error on ${osDirPath}:`, err);
-            // Only disable native watching for critical errors (like ENOSPC).
-            // @ts-ignore
             if (err.code === "ENOSPC" || err.errno === require("constants").ENOSPC) {
               fallbackToPolling();
             }
@@ -340,9 +349,11 @@ async function ensureWatchRoot(dirPath: string): Promise<void> {
         (e.code === "ENOTDIR" ||
             /Not a directory/.test(e.message) ||
             e.code === "EBADF" ||
-            /Bad file descriptor/.test(e.message))
+            /Bad file descriptor/.test(e.message) ||
+            /RootResolveError/.test(e.message) ||
+            /failed to resolve root/.test(e.message))
     ) {
-      console.warn(`Skipping watcher for ${osDirPath}: not a directory`);
+      console.warn(`Skipping watcher for ${osDirPath}: ${e.message || 'not watchable'}`);
       ignoredWatchRoots.add(dirPath);
     } else {
       console.error(`Failed to start watcher for ${osDirPath}:`, e);
