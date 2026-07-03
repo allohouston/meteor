@@ -49,8 +49,9 @@ export const normalizeModernConfig = (r = false) => Object.fromEntries(
  * @param {string|null} appDir - The application directory path. If null, only environment variables are used.
  * @returns {Object} - The initialized Meteor configuration object.
  */
-export function initMeteorConfig(appDir) {
-  const modernForced = JSON.parse(process.env.METEOR_MODERN || "false");
+export function initMeteorConfig(appDir = process.cwd()) {
+  const rawModern = process.env.METEOR_MODERN;
+  const modernForced = JSON.parse(rawModern && rawModern !== 'undefined' ? rawModern : 'false');
   let packageJson;
   if (appDir) {
     const packageJsonPath = files.pathJoin(appDir, 'package.json');
@@ -65,7 +66,10 @@ export function initMeteorConfig(appDir) {
   }
   setMeteorConfig({
     ...(packageJson?.meteor || {}),
-    modern: normalizeModernConfig(modernForced || packageJson?.meteor?.modern || false),
+    modern: {
+      ...normalizeModernConfig(modernForced || packageJson?.meteor?.modern || false),
+      ...(packageJson?.meteor?.verbose || packageJson?.meteor?.modern?.verbose) && { verbose: true },
+    },
   });
   return meteorConfig;
 }
