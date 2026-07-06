@@ -10,7 +10,10 @@ const { runFlow } = require("./maestro");
 const PLATFORMS = new Set(["ios", "android"]);
 const FLOW_PATH = path.resolve(__dirname, "..", "flows", "launch.yaml");
 const JUNIT_DIR = path.resolve(__dirname, "..", "junit");
-const HARD_TIMEOUT_MS = 8 * 60 * 1000;
+// Cold builds (dev bundle download + Cordova platform + xcodebuild) routinely
+// exceed 8 minutes on CI runners; keep this below the job-level timeout-minutes
+// so cleanup and artifact upload still run.
+const HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
 const EXIT_PASS = 0;
 const EXIT_FLOW_FAIL = 1;
