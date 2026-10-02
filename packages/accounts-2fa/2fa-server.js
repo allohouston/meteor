@@ -105,6 +105,15 @@ const assertEncryptionKey = key => {
  * @param {String} [options.encryptionKey] 32-byte AES-256-GCM key, base64. Secrets are stored encrypted when set.
  * @param {Boolean} [options.allowPlaintextSecrets=true] Accept secrets stored before encryption was enabled.
  * @param {{numRequests: Number, timeInterval: Number}} [options.rateLimit]
+ * @param {Object} [options.email] Email second factor. Disabled until `enabled` is set.
+ * @param {Boolean} [options.email.enabled]
+ * @param {Boolean} [options.email.offerToOtpUsers=true] Let a user who already has TOTP choose email.
+ * @param {Boolean} [options.email.requireVerified=true]
+ * @param {Number} [options.email.codeLength=6]
+ * @param {Number} [options.email.expirationMs=600000]
+ * @param {Number} [options.email.maxAttempts=5]
+ * @param {Number} [options.email.resendCooldownMs=60000]
+ * @param {String} [options.email.hashSecret] Server secret for the email-code HMAC. Without it, codes are hashed with SHA-256 and a warning is logged.
  */
 Accounts.configure2fa = options => {
   check(options, {
@@ -117,19 +126,37 @@ Accounts.configure2fa = options => {
       numRequests: Match.Integer,
       timeInterval: Match.Integer,
     }),
+    email: Match.Optional({
+      enabled: Match.Optional(Boolean),
+      codeLength: Match.Optional(Match.Integer),
+      expirationMs: Match.Optional(Match.Integer),
+      maxAttempts: Match.Optional(Match.Integer),
+      resendCooldownMs: Match.Optional(Match.Integer),
+      requireVerified: Match.Optional(Boolean),
+      offerToOtpUsers: Match.Optional(Boolean),
+      hashSecret: Match.Optional(Match.OneOf(String, null)),
+    }),
   });
 
   if (options.window !== undefined && options.window < 0) {
     throw new Error('accounts-2fa: window must be >= 0');
   }
+  if (options.email?.codeLength !== undefined &&
+    (options.email.codeLength < 4 || options.email.codeLength > 8)) {
+    throw new Error('accounts-2fa: email.codeLength must be between 4 and 8');
+  }
 
+  const { email, ...rest } = options;
   config = {
     ...config,
-    ...options,
+    ...rest,
     rateLimit: options.rateLimit
       ? { ...options.rateLimit }
       : config.rateLimit,
   };
+  if (email) {
+    Accounts._configure2faEmail(email);
+  }
 
   if (options.encryptionKey) {
     encryptionKey = assertEncryptionKey(options.encryptionKey);
