@@ -4,6 +4,33 @@ import QRCode from 'qrcode-svg';
 import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
 
+const validateChangeHooks = [];
+
+const registerHook = (hooks, fn) => {
+  hooks.push(fn);
+  return {
+    stop() {
+      const index = hooks.indexOf(fn);
+      if (index >= 0) {
+        hooks.splice(index, 1);
+      }
+    },
+  };
+};
+
+const runHooks = async (hooks, payload) => {
+  for (const hook of [...hooks]) {
+    await hook(payload);
+  }
+};
+
+/**
+ * @summary Reject an activation or a deactivation. Throw from the callback to refuse it.
+ * @locus Server
+ * @param {Function} fn Receives `{ type, user, connection }`. `type` is `activation` or `deactivation`.
+ */
+Accounts.validate2faChange = fn => registerHook(validateChangeHooks, fn);
+
 const TOTP_ALGORITHM = 'SHA1';
 const TOTP_DIGITS = 6;
 const TOTP_PERIOD = 30;
@@ -30,6 +57,44 @@ const generateActivationData = ({ issuer, label }) => {
     secret: secret.base32,
     uri: totp.toString(),
   };
+};
+
+/**
+ * @summary Configure the second factors offered at login. Call this at startup.
+ * @locus Server
+ * @param {Object} options
+ * @param {Object} [options.email] Email second factor. Disabled until `enabled` is set.
+ * @param {Boolean} [options.email.enabled]
+ * @param {Boolean} [options.email.offerToOtpUsers=true] Let a user who already has TOTP choose email.
+ * @param {Boolean} [options.email.requireVerified=true]
+ * @param {Number} [options.email.codeLength=6]
+ * @param {Number} [options.email.expirationMs=600000]
+ * @param {Number} [options.email.maxAttempts=5]
+ * @param {Number} [options.email.resendCooldownMs=60000]
+ * @param {String} [options.email.hashSecret] Server secret for the email-code HMAC. Without it, codes are hashed with SHA-256 and a warning is logged.
+ */
+Accounts.configure2fa = options => {
+  check(options, {
+    email: Match.Optional({
+      enabled: Match.Optional(Boolean),
+      codeLength: Match.Optional(Match.Integer),
+      expirationMs: Match.Optional(Match.Integer),
+      maxAttempts: Match.Optional(Match.Integer),
+      resendCooldownMs: Match.Optional(Match.Integer),
+      requireVerified: Match.Optional(Boolean),
+      offerToOtpUsers: Match.Optional(Boolean),
+      hashSecret: Match.Optional(Match.OneOf(String, null, undefined)),
+    }),
+  });
+
+  if (options.email?.codeLength !== undefined &&
+    (options.email.codeLength < 4 || options.email.codeLength > 8)) {
+    throw new Error('accounts-2fa: email.codeLength must be between 4 and 8');
+  }
+
+  if (options.email) {
+    Accounts._configure2faEmail(options.email);
+  }
 };
 
 Accounts._check2faEnabled = user => {
@@ -90,6 +155,12 @@ Meteor.methods({
       );
     }
 
+    await runHooks(validateChangeHooks, {
+      type: 'activation',
+      user,
+      connection: this.connection,
+    });
+
     const emails = user.emails || [];
     const { secret, uri } = generateActivationData({
       issuer: appName.trim(),
@@ -128,6 +199,13 @@ Meteor.methods({
         'The user does not have a secret generated. You may have to call the function generateSvgCode first.'
       );
     }
+
+    await runHooks(validateChangeHooks, {
+      type: 'activation',
+      user,
+      connection: this.connection,
+    });
+
     if (!Accounts._isTokenValid(twoFactorAuthentication.secret, code)) {
       Accounts._handleError('Invalid 2FA code', true, 'invalid-2fa-code');
     }
@@ -145,11 +223,18 @@ Meteor.methods({
     );
   },
   async disableUser2fa() {
-    const userId = Meteor.userId();
+    const user = await Meteor.userAsync();
+    const userId = user?._id;
 
     if (!userId) {
       throw new Meteor.Error(400, 'No user logged in.');
     }
+
+    await runHooks(validateChangeHooks, {
+      type: 'deactivation',
+      user,
+      connection: this.connection,
+    });
 
     await Meteor.users.updateAsync(
       { _id: userId },
