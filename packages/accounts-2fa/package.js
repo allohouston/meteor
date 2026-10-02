@@ -17,6 +17,7 @@ Package.onUse(function (api) {
 
   api.use("ecmascript");
   api.use("check", "server");
+  api.use("ddp-rate-limiter", "server");
 
   api.addFiles(["2fa-client.js"], "client");
   api.addFiles(["2fa-server.js"], "server");
@@ -26,6 +27,8 @@ Package.onTest(function (api) {
   api.use([
     "accounts-base",
     "accounts-password",
+    "ddp-client",
+    "ddp-common",
     "ecmascript",
     "tinytest",
     "random",
