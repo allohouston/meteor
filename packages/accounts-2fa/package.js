@@ -17,7 +17,9 @@ Package.onUse(function (api) {
 
   api.use("ecmascript");
   api.use("check", "server");
+  api.use("ddp-rate-limiter", "server");
   api.use("email", "server");
+  api.use("oauth-encryption", "server", { weak: true });
 
   api.addFiles(["2fa-client.js"], "client");
   api.addFiles(["2fa-email.js", "2fa-methods.js", "2fa-server.js"], "server");
@@ -33,6 +35,7 @@ Package.onTest(function (api) {
     "ecmascript",
     "tinytest",
     "random",
+    "oauth-encryption",
     "accounts-2fa",
   ]);
 
