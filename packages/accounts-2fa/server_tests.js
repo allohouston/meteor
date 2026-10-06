@@ -4,15 +4,19 @@ import { DDPCommon } from 'meteor/ddp-common';
 import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import * as OTPAuth from 'otpauth';
 import { Random } from 'meteor/random';
+import crypto from 'crypto';
+import { OAuthEncryption } from 'meteor/oauth-encryption';
 
 const findUserById =
   async id => await Meteor.users.findOneAsync(id);
 
 const restore2faConfig = () => {
+  OAuthEncryption.loadKey(null);
   Accounts.configure2fa({
     window: 10,
     preventReplay: true,
     loginTypes: ['password', 'passwordless'],
+    allowPlaintextSecrets: true,
   });
 };
 
@@ -113,6 +117,70 @@ Tinytest.add('account - 2fa - existing lowercase secrets remain valid', test => 
 
   test.isTrue(Accounts._isTokenValid(secret, token));
 });
+
+Tinytest.addAsync(
+  'account - 2fa - sealed secrets still validate and plaintext can be rejected',
+  async test => {
+    const key = crypto.randomBytes(16).toString('base64');
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const userId = await Accounts.insertUserDoc(
+      {},
+      {
+        emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+        services: {
+          twoFactorAuthentication: { type: 'otp', secret },
+        },
+      }
+    );
+
+    try {
+      OAuthEncryption.loadKey(key);
+      Accounts.configure2fa({ allowPlaintextSecrets: false });
+
+      test.equal(await Accounts.encryptExisting2faSecrets(), 1);
+      const user = await findUserById(userId);
+      const stored = user.services.twoFactorAuthentication.secret;
+      test.isTrue(OAuthEncryption.isSealed(stored));
+
+      const { token } = Accounts._generate2faToken(stored);
+      test.isTrue(Accounts._isTokenValid(stored, token));
+      test.isFalse(Accounts._isTokenValid(secret, token));
+
+      OAuthEncryption.loadKey(crypto.randomBytes(16).toString('base64'));
+      test.isFalse(Accounts._isTokenValid(stored, token));
+    } finally {
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'account - 2fa - a replayed activation code on a sealed secret is an invalid code',
+  async test => {
+    OAuthEncryption.loadKey(crypto.randomBytes(16).toString('base64'));
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const sealed = OAuthEncryption.seal(secret);
+    const userId = await insertOtpUser(sealed, {
+      secret: sealed,
+      lastUsedStep: Math.floor(Date.now() / 30_000) + 1,
+    });
+    const { token } = Accounts._generate2faToken(secret);
+
+    try {
+      let error = null;
+      try {
+        await enableUser2fa(userId, token);
+      } catch (caught) {
+        error = caught;
+      }
+      test.equal(error && error.error, 'invalid-2fa-code');
+    } finally {
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
 
 Tinytest.addAsync(
   'account - 2fa - a login code cannot be replayed',

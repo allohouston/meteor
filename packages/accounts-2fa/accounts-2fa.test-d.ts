@@ -7,6 +7,7 @@ import type {
   TwoFactorChangeEvent,
   TwoFactorCodeFailure,
   TwoFactorConfigureOptions,
+  TwoFactorStoredSecret,
 } from "./accounts-2fa";
 
 expectTypeOf<TwoFactorActivationData>().toEqualTypeOf<{
@@ -20,7 +21,12 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   preventReplay?: boolean;
   loginTypes?: string[];
   rateLimit?: { numRequests: number; timeInterval: number };
+  allowPlaintextSecrets?: boolean;
 }>();
+
+expectTypeOf<string>().toMatchTypeOf<TwoFactorStoredSecret>();
+expectTypeOf(Accounts.encryptExisting2faSecrets()).toEqualTypeOf<Promise<number>>();
+Accounts.configure2fa({ allowPlaintextSecrets: false });
 
 Accounts.configure2fa({ rateLimit: { numRequests: 5, timeInterval: 60_000 } });
 
@@ -73,6 +79,7 @@ expectTypeOf(Accounts.validate2faChange).toBeFunction();
 expectTypeOf(Accounts.on2faChange).toBeFunction();
 expectTypeOf(Accounts.on2faCodeFailure).toBeFunction();
 expectTypeOf(Accounts.reset2faForUser).toBeFunction();
+expectTypeOf(Accounts.encryptExisting2faSecrets).toBeFunction();
 expectTypeOf(Accounts._check2faEnabled).toBeFunction();
 expectTypeOf(Accounts._is2faEnabledForUser).toBeFunction();
 expectTypeOf(Accounts._generate2faToken).toBeFunction();

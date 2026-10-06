@@ -16,6 +16,8 @@ export interface TwoFactorConfigureOptions {
   loginTypes?: string[];
   /** Per-user limit for the 2FA methods (default 5 calls per 60 000 ms). Setting it again replaces the rule. */
   rateLimit?: { numRequests: number; timeInterval: number };
+  /** Accept secrets stored before encryption was enabled (default true). */
+  allowPlaintextSecrets?: boolean;
 }
 
 /** Payload passed to `Accounts.on2faChange` callbacks. */
@@ -44,6 +46,9 @@ export interface TwoFactorChangeAttempt {
   user: Meteor.User;
   connection: Meteor.Connection | null;
 }
+
+/** A stored TOTP secret: plaintext, or a value sealed by `oauth-encryption`. */
+export type TwoFactorStoredSecret = string | { [key: string]: unknown };
 
 declare module 'meteor/accounts-base' {
   namespace Accounts {
@@ -103,6 +108,12 @@ declare module 'meteor/accounts-base' {
       options?: { connection?: Meteor.Connection | null }
     ): Promise<void>;
 
+    /**
+     * Seal the TOTP secrets still stored in plaintext (server only).
+     * Requires `oauth-encryption` with a loaded `oauthSecretKey`. Resolves to the number of users migrated.
+     */
+    function encryptExisting2faSecrets(): Promise<number>;
+
     /** Returns true if the user document has an active `services.twoFactorAuthentication`. */
     function _check2faEnabled(user: Meteor.User): boolean;
 
@@ -110,13 +121,13 @@ declare module 'meteor/accounts-base' {
     function _is2faEnabledForUser(): Promise<boolean>;
 
     /** Generate an OTP token for the given secret, at `timestamp` (ms) when given. */
-    function _generate2faToken(secret: string, timestamp?: number): { token: string };
+    function _generate2faToken(secret: TwoFactorStoredSecret, timestamp?: number): { token: string };
 
     /** Verify an OTP code and return its time step, or null when invalid (server only). */
-    function _verify2faToken(secret: string, code: string): number | null;
+    function _verify2faToken(secret: TwoFactorStoredSecret, code: string): number | null;
 
     /** Verify an OTP code against a secret (server only). */
-    function _isTokenValid(secret: string, code: string): boolean;
+    function _isTokenValid(secret: TwoFactorStoredSecret, code: string): boolean;
   }
 }
 

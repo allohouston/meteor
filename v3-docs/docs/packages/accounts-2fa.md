@@ -139,8 +139,11 @@ Accounts.configure2fa({
   preventReplay: true,
   loginTypes: ['password', 'passwordless'], // replaces the default list
   rateLimit: { numRequests: 5, timeInterval: 60_000 },
+  allowPlaintextSecrets: true, // set to false after migrating existing secrets
 });
 ```
+
+When the app also has `oauth-encryption` and calls `Accounts.config({ oauthSecretKey })` with a 16-byte base64 key, newly stored secrets are sealed with AES-128-GCM. Without that package, secrets stay in plaintext, which is the historical behavior. Migrate secrets that are already in the database with `Accounts.encryptExisting2faSecrets()`, then set `allowPlaintextSecrets` to `false`. The migration updates a user only when the secret is still the plaintext value it read.
 
 `rateLimit` can be set again later, including from `Meteor.startup`. The previous rule is replaced.
 
