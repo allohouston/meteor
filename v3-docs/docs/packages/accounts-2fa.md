@@ -106,8 +106,11 @@ import { Accounts } from 'meteor/accounts-base';
 Accounts.configure2fa({
   window: 1, // steps accepted on each side of the current 30s step (default 10)
   preventReplay: true,
+  allowPlaintextSecrets: true, // set to false after migrating existing secrets
 });
 ```
+
+When the app also has `oauth-encryption` and calls `Accounts.config({ oauthSecretKey })` with a 16-byte base64 key, newly stored secrets are sealed with AES-128-GCM. Without that package, secrets stay in plaintext, which is the historical behavior. Migrate secrets that are already in the database with `Accounts.encryptExisting2faSecrets()`, then set `allowPlaintextSecrets` to `false`. The migration updates a user only when the secret is still the plaintext value it read.
 
 ## Log in with 2FA {#log-in-with-2fa}
 
