@@ -3,6 +3,7 @@ import { Accounts } from "meteor/accounts-base";
 import type {
   TwoFactorActivationData,
   TwoFactorConfigureOptions,
+  TwoFactorStoredSecret,
 } from "./accounts-2fa";
 
 expectTypeOf<TwoFactorActivationData>().toEqualTypeOf<{
@@ -15,7 +16,12 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   window?: number;
   preventReplay?: boolean;
   loginTypes?: string[];
+  allowPlaintextSecrets?: boolean;
 }>();
+
+expectTypeOf<string>().toMatchTypeOf<TwoFactorStoredSecret>();
+expectTypeOf(Accounts.encryptExisting2faSecrets()).toEqualTypeOf<Promise<number>>();
+Accounts.configure2fa({ allowPlaintextSecrets: false });
 
 // Example from the package guide.
 Accounts.configure2fa({ window: 1 });
@@ -33,6 +39,7 @@ expectTypeOf(Accounts.generate2faActivationQrCode).toBeFunction();
 expectTypeOf(Accounts.enableUser2fa).toBeFunction();
 expectTypeOf(Accounts.disableUser2fa).toBeFunction();
 expectTypeOf(Accounts.configure2fa).toBeFunction();
+expectTypeOf(Accounts.encryptExisting2faSecrets).toBeFunction();
 expectTypeOf(Accounts._check2faEnabled).toBeFunction();
 expectTypeOf(Accounts._is2faEnabledForUser).toBeFunction();
 expectTypeOf(Accounts._generate2faToken).toBeFunction();

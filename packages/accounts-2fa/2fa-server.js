@@ -3,6 +3,7 @@ import * as OTPAuth from 'otpauth';
 import QRCode from 'qrcode-svg';
 import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
+import { EJSON } from 'meteor/ejson';
 
 const TOTP_ALGORITHM = 'SHA1';
 const TOTP_DIGITS = 6;
@@ -15,6 +16,7 @@ const DEFAULT_CONFIG = {
   window: DEFAULT_WINDOW,
   preventReplay: true,
   loginTypes: DEFAULT_LOGIN_TYPES,
+  allowPlaintextSecrets: true,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -49,6 +51,7 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Number} [options.window=10] TOTP steps accepted on each side of the current step.
  * @param {Boolean} [options.preventReplay=true] Reject a step at or before the last accepted one.
  * @param {String[]} [options.loginTypes] Login attempt types that get replay protection. Replaces the default list.
+ * @param {Boolean} [options.allowPlaintextSecrets=true] Accept secrets stored before encryption was enabled.
  */
 Accounts.configure2fa = options => {
   check(options, {
@@ -59,12 +62,80 @@ Accounts.configure2fa = options => {
     })),
     preventReplay: Match.Optional(Boolean),
     loginTypes: Match.Optional([String]),
+    allowPlaintextSecrets: Match.Optional(Boolean),
   });
 
   config = {
     ...config,
     ...options,
   };
+};
+
+const oauthEncryption = () => Package['oauth-encryption']?.OAuthEncryption;
+
+const encryptSecret = plain => {
+  const encryption = oauthEncryption();
+  if (!encryption?.keyIsLoaded()) {
+    return plain;
+  }
+  return encryption.seal(plain);
+};
+
+const decryptSecret = stored => {
+  const encryption = oauthEncryption();
+  if (encryption?.isSealed(stored)) {
+    if (!encryption.keyIsLoaded()) {
+      return null;
+    }
+    try {
+      return encryption.open(stored);
+    } catch (error) {
+      return null;
+    }
+  }
+  if (typeof stored === 'string' && stored.length > 0 && config.allowPlaintextSecrets) {
+    return stored;
+  }
+  return null;
+};
+
+/**
+ * @summary Encrypt secrets that are still stored in plaintext.
+ * Skips a user whose secret changed after it was read.
+ * @locus Server
+ * @returns {Promise<Number>} Number of users migrated.
+ */
+Accounts.encryptExisting2faSecrets = async () => {
+  if (!oauthEncryption()?.keyIsLoaded()) {
+    throw new Error(
+      'accounts-2fa: add oauth-encryption and set Accounts.config({ oauthSecretKey }) before encrypting existing secrets'
+    );
+  }
+  const users = await Meteor.users
+    .find(
+      { 'services.twoFactorAuthentication.secret': { $exists: true } },
+      { fields: { 'services.twoFactorAuthentication.secret': 1 } }
+    )
+    .fetchAsync();
+
+  let migrated = 0;
+  for (const user of users) {
+    const secret = user.services?.twoFactorAuthentication?.secret;
+    if (typeof secret !== 'string') {
+      continue;
+    }
+    const updated = await Meteor.users.updateAsync(
+      {
+        _id: user._id,
+        'services.twoFactorAuthentication.secret': secret,
+      },
+      {
+        $set: { 'services.twoFactorAuthentication.secret': encryptSecret(secret) },
+      }
+    );
+    migrated += typeof updated === 'number' ? updated : 0;
+  }
+  return migrated;
 };
 
 Accounts._check2faEnabled = user => {
@@ -85,13 +156,13 @@ Accounts._is2faEnabledForUser = async () => {
 };
 
 Accounts._generate2faToken = (secret, timestamp = Date.now()) => ({
-  token: getTotp({ secret }).generate({ timestamp }),
+  token: getTotp({ secret: decryptSecret(secret) || secret }).generate({ timestamp }),
 });
 
 /**
  * @summary Validate a TOTP code and return the matching time step.
  * @locus Server
- * @param {String} secret
+ * @param {String|Object} secret Plaintext secret, or a value sealed by oauth-encryption.
  * @param {String} code
  * @returns {Number|null}
  */
@@ -102,12 +173,13 @@ Accounts._verify2faToken = (secret, code) => {
       'The function _verify2faToken can only be called on the server'
     );
   }
-  if (typeof secret !== 'string' || !secret || typeof code !== 'string') {
+  const plain = decryptSecret(secret);
+  if (!plain || typeof code !== 'string') {
     return null;
   }
   const now = Date.now();
   try {
-    const delta = getTotp({ secret }).validate({
+    const delta = getTotp({ secret: plain }).validate({
       token: code.replace(/\W+/g, ''),
       window: config.window,
       timestamp: now,
@@ -227,7 +299,7 @@ Meteor.methods({
       {
         $set: {
           'services.twoFactorAuthentication': {
-            secret,
+            secret: encryptSecret(secret),
           },
         },
       }
@@ -276,7 +348,7 @@ Meteor.methods({
       const current = await Meteor.users.findOneAsync(user._id, {
         fields: { 'services.twoFactorAuthentication.secret': 1 },
       });
-      if (current?.services?.twoFactorAuthentication?.secret !== twoFactorAuthentication.secret) {
+      if (!EJSON.equals(current?.services?.twoFactorAuthentication?.secret, twoFactorAuthentication.secret)) {
         throw secretChangedError();
       }
       throw invalidCodeError();
