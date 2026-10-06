@@ -1,4 +1,6 @@
 import { Accounts } from 'meteor/accounts-base';
+import { DDP } from 'meteor/ddp-client';
+import { DDPCommon } from 'meteor/ddp-common';
 import * as OTPAuth from 'otpauth';
 import { Random } from 'meteor/random';
 
@@ -91,3 +93,34 @@ Tinytest.addAsync(
     }
   }
 );
+
+Tinytest.addAsync('account - 2fa - validate2faChange can refuse an activation', async test => {
+  const guard = Accounts.validate2faChange(() => {
+    throw new Error('change-refused');
+  });
+  const userId = await Accounts.insertUserDoc(
+    {},
+    { emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }] }
+  );
+  const method = Meteor.server.method_handlers.generate2faActivationQrCode;
+  const invocation = new DDPCommon.MethodInvocation({
+    userId,
+    isSimulation: false,
+    setUserId: () => {},
+    unblock: () => {},
+    connection: { id: 'conn', close() {} },
+    randomSeed: Random.id(),
+  });
+  try {
+    await DDP._CurrentMethodInvocation.withValue(invocation, () =>
+      method.apply(invocation, ['Test app'])
+    );
+    test.fail('the activation should have been refused');
+  } catch (error) {
+    test.equal(error.message, 'change-refused');
+  } finally {
+    guard.stop();
+  }
+  const user = await Meteor.users.findOneAsync(userId);
+  test.isFalse(!!user.services?.twoFactorAuthentication?.secret);
+});

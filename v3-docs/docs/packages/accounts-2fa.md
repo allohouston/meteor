@@ -96,6 +96,8 @@ To disable 2FA for a user use this method:
 
 To call this function the user must be already logged in.
 
+`Accounts.validate2faChange(fn)` receives `{ type, user, connection }` with `type` equal to `activation` or `deactivation`. Throw from `fn` to refuse the change. The registration returns `{ stop() }`.
+
 ## Configuration {#configuration}
 
 Call `Accounts.configure2fa` at server startup. Both options are optional. The accepted window stays at 10 steps on each side, which matches previous releases. A TOTP code can no longer be reused: `preventReplay` defaults to `true`, because RFC 6238 section 5.2 says a verifier must not accept a second attempt of an OTP after the first successful validation. Set `preventReplay` to `false` to keep the previous behavior.
