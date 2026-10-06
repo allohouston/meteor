@@ -3,6 +3,7 @@ import * as OTPAuth from 'otpauth';
 import QRCode from 'qrcode-svg';
 import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
+import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 
 const validateChangeHooks = [];
 
@@ -36,10 +37,16 @@ const TOTP_DIGITS = 6;
 const TOTP_PERIOD = 30;
 const TOTP_SECRET_SIZE = 20;
 const DEFAULT_WINDOW = 10;
+const TWO_FACTOR_METHODS = [
+  'generate2faActivationQrCode',
+  'enableUser2fa',
+  'disableUser2fa',
+];
 
 const DEFAULT_CONFIG = {
   window: DEFAULT_WINDOW,
   preventReplay: true,
+  rateLimit: { numRequests: 5, timeInterval: 60_000 },
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -73,21 +80,72 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Object} options
  * @param {Number} [options.window=10] TOTP steps accepted on each side of the current step.
  * @param {Boolean} [options.preventReplay=true] Reject a code whose time step was already used.
+ * @param {Object} [options.rateLimit] Per-user limit for the 2FA methods.
+ * @param {Number} options.rateLimit.numRequests
+ * @param {Number} options.rateLimit.timeInterval Interval in milliseconds.
  */
 Accounts.configure2fa = options => {
   check(options, {
     window: Match.Optional(Match.Integer),
     preventReplay: Match.Optional(Boolean),
+    rateLimit: Match.Optional({
+      numRequests: Match.Integer,
+      timeInterval: Match.Integer,
+    }),
   });
 
   if (options.window !== undefined && options.window < 0) {
     throw new Error('accounts-2fa: window must be >= 0');
   }
 
+  const rateLimitChanged = options.rateLimit !== undefined;
   config = {
     ...config,
     ...options,
+    rateLimit: options.rateLimit
+      ? { ...options.rateLimit }
+      : config.rateLimit,
   };
+  if (rateLimitChanged && rateLimitRuleId) {
+    applyRateLimit();
+  }
+};
+
+const changeHooks = [];
+const codeFailureHooks = [];
+
+/**
+ * @summary Called after 2FA is enabled, disabled or reset.
+ * This package does not check who may call the server helpers. The app decides.
+ * @locus Server
+ * @param {Function} fn Receives `{ event, userId, connection }`. `event` is `enabled`, `disabled` or `reset`.
+ */
+Accounts.on2faChange = fn => registerHook(changeHooks, fn);
+
+/**
+ * @summary Called when a TOTP code is rejected.
+ * @locus Server
+ * @param {Function} fn Receives `{ userId, method }`.
+ */
+Accounts.on2faCodeFailure = fn => registerHook(codeFailureHooks, fn);
+
+/**
+ * @summary Remove 2FA from a user. Intended for an administrator recovery flow.
+ * There is no permission check: this is not a method, and the app decides who may call it.
+ * @locus Server
+ * @param {String} userId
+ * @param {Object} [options]
+ */
+Accounts.reset2faForUser = async (userId, options = {}) => {
+  check(userId, String);
+  await Meteor.users.updateAsync(userId, {
+    $unset: { 'services.twoFactorAuthentication': 1 },
+  });
+  await runHooks(changeHooks, {
+    event: 'reset',
+    userId,
+    connection: options.connection || null,
+  });
 };
 
 Accounts._check2faEnabled = user => {
@@ -178,7 +236,8 @@ const consumeStep = async (userId, step, extraSet = {}, extraSelector = {}) => {
   return affected > 0;
 };
 
-const rejectInvalidCode = () => {
+const rejectInvalidCode = async (userId, method) => {
+  await runHooks(codeFailureHooks, { userId, method });
   Accounts._handleError('Invalid 2FA code', true, 'invalid-2fa-code');
 };
 
@@ -202,11 +261,11 @@ Accounts.validateLoginAttempt(async attempt => {
     code
   );
   if (step === null) {
-    rejectInvalidCode();
+    await rejectInvalidCode(user._id, 'login');
   }
   const consumed = await consumeStep(user._id, step);
   if (!consumed) {
-    rejectInvalidCode();
+    await rejectInvalidCode(user._id, 'login');
   }
   return true;
 });
@@ -281,7 +340,7 @@ Meteor.methods({
 
     const step = Accounts._verify2faToken(twoFactorAuthentication.secret, code);
     if (step === null) {
-      rejectInvalidCode();
+      await rejectInvalidCode(user._id, 'enableUser2fa');
     }
 
     const secretSelector = {
@@ -300,8 +359,14 @@ Meteor.methods({
       )) > 0;
 
     if (!enabled) {
-      rejectInvalidCode();
+      await rejectInvalidCode(user._id, 'enableUser2fa');
     }
+
+    await runHooks(changeHooks, {
+      event: 'enabled',
+      userId: user._id,
+      connection: this.connection,
+    });
   },
   async disableUser2fa() {
     const user = await Meteor.userAsync();
@@ -325,11 +390,34 @@ Meteor.methods({
         },
       }
     );
+    await runHooks(changeHooks, {
+      event: 'disabled',
+      userId,
+      connection: this.connection,
+    });
   },
   async has2faEnabled() {
     return Accounts._is2faEnabledForUser();
   },
 });
+
+let rateLimitRuleId = null;
+const applyRateLimit = () => {
+  if (rateLimitRuleId) {
+    DDPRateLimiter.removeRule(rateLimitRuleId);
+  }
+  rateLimitRuleId = DDPRateLimiter.addRule(
+    {
+      type: 'method',
+      name: name => TWO_FACTOR_METHODS.includes(name),
+      userId: () => true,
+    },
+    config.rateLimit.numRequests,
+    config.rateLimit.timeInterval
+  );
+};
+
+Meteor.startup(applyRateLimit);
 
 Accounts.addAutopublishFields({
   forLoggedInUser: ['services.twoFactorAuthentication.type'],

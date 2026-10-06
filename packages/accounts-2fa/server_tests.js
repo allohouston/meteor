@@ -1,6 +1,7 @@
 import { Accounts } from 'meteor/accounts-base';
 import { DDP } from 'meteor/ddp-client';
 import { DDPCommon } from 'meteor/ddp-common';
+import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import * as OTPAuth from 'otpauth';
 import { Random } from 'meteor/random';
 
@@ -123,4 +124,88 @@ Tinytest.addAsync('account - 2fa - validate2faChange can refuse an activation', 
   }
   const user = await Meteor.users.findOneAsync(userId);
   test.isFalse(!!user.services?.twoFactorAuthentication?.secret);
+});
+
+Tinytest.addAsync('account - 2fa - reset2faForUser clears 2FA and notifies hooks', async test => {
+  const userId = await Accounts.insertUserDoc(
+    {},
+    {
+      emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+      services: {
+        twoFactorAuthentication: { type: 'otp', secret: 'superSecret' },
+      },
+    }
+  );
+  let event = null;
+  const hook = Accounts.on2faChange(payload => {
+    event = payload;
+  });
+
+  try {
+    await Accounts.reset2faForUser(userId, { connection: { id: 'conn' } });
+    const user = await findUserById(userId);
+    test.isFalse(Accounts._check2faEnabled(user));
+    test.equal(event && event.event, 'reset');
+    test.equal(event && event.userId, userId);
+  } finally {
+    hook.stop();
+    await Accounts.users.removeAsync(userId);
+  }
+});
+
+Tinytest.addAsync('account - 2fa - a rejected code notifies on2faCodeFailure', async test => {
+  const secret = new OTPAuth.Secret({ size: 20 }).base32;
+  const userId = await Accounts.insertUserDoc(
+    {},
+    {
+      emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+      services: {
+        twoFactorAuthentication: { type: 'otp', secret },
+      },
+    }
+  );
+  let failure = null;
+  const hook = Accounts.on2faCodeFailure(payload => {
+    failure = payload;
+  });
+  const invocation = {
+    connection: { id: Random.id(), close() {} },
+    setUserId() {},
+  };
+
+  try {
+    await Accounts._attemptLogin(
+      invocation,
+      'login',
+      [{ user: { id: userId }, code: '000000' }],
+      { userId, type: 'password' }
+    );
+    test.fail('the code should have been rejected');
+  } catch (error) {
+    test.equal(error.error, 'invalid-2fa-code');
+    test.equal(failure && failure.userId, userId);
+    test.equal(failure && failure.method, 'login');
+  } finally {
+    hook.stop();
+    await Accounts.users.removeAsync(userId);
+  }
+});
+
+Tinytest.addAsync('account - 2fa - configure2fa replaces the rate limit after startup', async test => {
+  const beforeIds = new Set(Object.keys(DDPRateLimiter.printRules()));
+  Accounts.configure2fa({
+    rateLimit: { numRequests: 7, timeInterval: 12345 },
+  });
+  const after = DDPRateLimiter.printRules();
+  const added = Object.keys(after).filter(id => !beforeIds.has(id));
+
+  try {
+    test.equal(added.length, 1);
+    test.equal(after[added[0]].options.numRequestsAllowed, 7);
+    test.equal(after[added[0]].options.intervalTime, 12345);
+  } finally {
+    Accounts.configure2fa({
+      rateLimit: { numRequests: 5, timeInterval: 60_000 },
+    });
+  }
 });

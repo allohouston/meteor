@@ -108,8 +108,15 @@ import { Accounts } from 'meteor/accounts-base';
 Accounts.configure2fa({
   window: 1, // steps accepted on each side of the current 30s step (default 10)
   preventReplay: true,
+  rateLimit: { numRequests: 5, timeInterval: 60_000 },
 });
 ```
+
+`rateLimit` can be set again later, including from `Meteor.startup`. The previous rule is replaced.
+
+`Accounts.on2faChange(fn)` receives an event, the user id and the connection after 2FA is enabled, disabled or reset. `Accounts.on2faCodeFailure(fn)` receives the user id and the method name when a code is rejected. Each registration returns an object with `stop()`.
+
+`Accounts.reset2faForUser(userId)` removes 2FA from the server without a code. It is not a method and it does not check permissions. The app decides who may call it.
 
 ## Log in with 2FA {#log-in-with-2fa}
 
