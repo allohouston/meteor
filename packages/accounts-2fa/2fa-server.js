@@ -13,6 +13,7 @@ const DEFAULT_WINDOW = 10;
 const DEFAULT_CONFIG = {
   window: DEFAULT_WINDOW,
   preventReplay: true,
+  requireCodeToDisable: false,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -46,11 +47,13 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Object} options
  * @param {Number} [options.window=10] TOTP steps accepted on each side of the current step.
  * @param {Boolean} [options.preventReplay=true] Reject a code whose time step was already used.
+ * @param {Boolean} [options.requireCodeToDisable=false] Require a valid TOTP code to disable an active authenticator.
  */
 Accounts.configure2fa = options => {
   check(options, {
     window: Match.Optional(Match.Integer),
     preventReplay: Match.Optional(Boolean),
+    requireCodeToDisable: Match.Optional(Boolean),
   });
 
   if (options.window !== undefined && options.window < 0) {
@@ -264,11 +267,29 @@ Meteor.methods({
       rejectInvalidCode();
     }
   },
-  async disableUser2fa() {
-    const userId = Meteor.userId();
+  async disableUser2fa(code) {
+    if (code !== undefined) {
+      check(code, String);
+    }
+    const user = await Meteor.userAsync();
+    const userId = user?._id;
 
     if (!userId) {
       throw new Meteor.Error(400, 'No user logged in.');
+    }
+
+    if (config.requireCodeToDisable && Accounts._check2faEnabled(user)) {
+      const secret = user.services?.twoFactorAuthentication?.secret;
+      const step = secret ? Accounts._verify2faToken(secret, code) : null;
+      if (step === null) {
+        rejectInvalidCode();
+      }
+      if (config.preventReplay) {
+        const consumed = await consumeStep(userId, step);
+        if (!consumed) {
+          rejectInvalidCode();
+        }
+      }
     }
 
     await Meteor.users.updateAsync(

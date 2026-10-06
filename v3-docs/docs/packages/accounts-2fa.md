@@ -96,6 +96,8 @@ To disable 2FA for a user use this method:
 
 To call this function the user must be already logged in.
 
+By default, `Accounts.disableUser2fa(callback)` still works with no code. Set `Accounts.configure2fa({ requireCodeToDisable: true })` to require a current TOTP code before an active authenticator can be removed. That is the recommended setting. A secret that was generated but never activated can still be discarded without a code.
+
 ## Configuration {#configuration}
 
 Call `Accounts.configure2fa` at server startup. Both options are optional. The accepted window stays at 10 steps on each side, which matches previous releases. A TOTP code can no longer be reused: `preventReplay` defaults to `true`, because RFC 6238 section 5.2 says a verifier must not accept a second attempt of an OTP after the first successful validation. Set `preventReplay` to `false` to keep the previous behavior.
@@ -106,6 +108,7 @@ import { Accounts } from 'meteor/accounts-base';
 Accounts.configure2fa({
   window: 1, // steps accepted on each side of the current 30s step (default 10)
   preventReplay: true,
+  requireCodeToDisable: true, // recommended; the default is false
 });
 ```
 
