@@ -15,6 +15,7 @@ const DEFAULT_CONFIG = {
   window: DEFAULT_WINDOW,
   preventReplay: true,
   loginTypes: DEFAULT_LOGIN_TYPES,
+  requireCodeToDisable: false,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -49,6 +50,7 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Number} [options.window=10] TOTP steps accepted on each side of the current step.
  * @param {Boolean} [options.preventReplay=true] Reject a step at or before the last accepted one.
  * @param {String[]} [options.loginTypes] Login attempt types that get replay protection. Replaces the default list.
+ * @param {Boolean} [options.requireCodeToDisable=false] Require a valid TOTP code to disable an active authenticator.
  */
 Accounts.configure2fa = options => {
   check(options, {
@@ -59,6 +61,7 @@ Accounts.configure2fa = options => {
     })),
     preventReplay: Match.Optional(Boolean),
     loginTypes: Match.Optional([String]),
+    requireCodeToDisable: Match.Optional(Boolean),
   });
 
   config = {
@@ -282,11 +285,34 @@ Meteor.methods({
       throw invalidCodeError();
     }
   },
-  async disableUser2fa() {
+  async disableUser2fa(code) {
+    if (code !== undefined) {
+      check(code, String);
+    }
     const userId = Meteor.userId();
 
     if (!userId) {
       throw new Meteor.Error(400, 'No user logged in.');
+    }
+
+    // Meteor.userAsync() applies defaultFieldSelector, which may omit services.
+    const user = await Meteor.users.findOneAsync(userId, {
+      fields: { 'services.twoFactorAuthentication': 1 },
+    });
+    if (config.requireCodeToDisable && user && Accounts._check2faEnabled(user)) {
+      const secret = user.services.twoFactorAuthentication.secret;
+      const step = Accounts._verify2faToken(secret, code);
+      if (step === null) {
+        throw invalidCodeError();
+      }
+      if (config.preventReplay) {
+        const consumed = await consumeStep(userId, step, {}, {
+          'services.twoFactorAuthentication.secret': secret,
+        });
+        if (!consumed) {
+          throw invalidCodeError();
+        }
+      }
     }
 
     await Meteor.users.updateAsync(

@@ -15,7 +15,15 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   window?: number;
   preventReplay?: boolean;
   loginTypes?: string[];
+  requireCodeToDisable?: boolean;
 }>();
+
+Accounts.configure2fa({ requireCodeToDisable: true });
+Accounts.disableUser2fa();
+Accounts.disableUser2fa(() => {});
+Accounts.disableUser2fa("123456", error => {
+  expectTypeOf(error).toEqualTypeOf<Error | undefined>();
+});
 
 // Example from the package guide.
 Accounts.configure2fa({ window: 1 });

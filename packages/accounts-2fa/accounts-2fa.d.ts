@@ -14,6 +14,8 @@ export interface TwoFactorConfigureOptions {
   preventReplay?: boolean;
   /** Login attempt types that get replay protection. Replaces the default `['password', 'passwordless']`. */
   loginTypes?: string[];
+  /** Require a current TOTP code to disable an active authenticator (default false). */
+  requireCodeToDisable?: boolean;
 }
 
 declare module 'meteor/accounts-base' {
@@ -40,8 +42,10 @@ declare module 'meteor/accounts-base' {
 
     /**
      * Disable 2FA for the logged-in user.
+     * Pass a current code when the server sets `requireCodeToDisable`.
      */
     function disableUser2fa(callback?: (error?: Error) => void): void;
+    function disableUser2fa(code: string, callback?: (error?: Error) => void): void;
 
     /** Configure TOTP verification and replay protection (server only). */
     function configure2fa(options: TwoFactorConfigureOptions): void;

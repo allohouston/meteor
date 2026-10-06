@@ -29,6 +29,7 @@ Package.onTest(function (api) {
     "accounts-base",
     "accounts-password",
     "ddp-client",
+    "ddp-common",
     "ecmascript",
     "tinytest",
     "random",
