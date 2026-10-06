@@ -67,10 +67,21 @@ Accounts.enableUser2fa = (code, callback) => {
 /**
  * @summary Disable user 2FA
  * @locus Client
+ * @param {String|Function} [codeOrCallback] TOTP code, when the server sets
+ *   `requireCodeToDisable` to true. Pass the callback alone to call it the
+ *   historical way, which still works when that option is left at its default.
  * @param {Function} [callback] Optional callback.
  *   Called with no arguments on success, or with a single `Error` argument
  *   on failure.
  */
-Accounts.disableUser2fa = callback => {
-  Accounts.connection.call('disableUser2fa', callback);
+Accounts.disableUser2fa = (codeOrCallback, callback) => {
+  if (typeof codeOrCallback === 'function') {
+    Accounts.connection.call('disableUser2fa', codeOrCallback);
+    return;
+  }
+  if (codeOrCallback === undefined) {
+    Accounts.connection.call('disableUser2fa', callback);
+    return;
+  }
+  Accounts.connection.call('disableUser2fa', codeOrCallback, callback);
 };

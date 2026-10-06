@@ -58,6 +58,7 @@ const DEFAULT_CONFIG = {
   loginTypes: DEFAULT_LOGIN_TYPES,
   rateLimit: { numRequests: 5, timeInterval: 60_000 },
   allowPlaintextSecrets: true,
+  requireCodeToDisable: false,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -96,6 +97,7 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Number} options.rateLimit.numRequests
  * @param {Number} options.rateLimit.timeInterval Interval in milliseconds.
  * @param {Boolean} [options.allowPlaintextSecrets=true] Accept secrets stored before encryption was enabled.
+ * @param {Boolean} [options.requireCodeToDisable=false] Require a valid TOTP code to disable an active authenticator.
  */
 Accounts.configure2fa = options => {
   check(options, {
@@ -111,6 +113,7 @@ Accounts.configure2fa = options => {
       timeInterval: Match.Integer,
     }),
     allowPlaintextSecrets: Match.Optional(Boolean),
+    requireCodeToDisable: Match.Optional(Boolean),
   });
 
   const rateLimitChanged = options.rateLimit !== undefined;
@@ -482,7 +485,10 @@ Meteor.methods({
       connection: this.connection,
     });
   },
-  async disableUser2fa() {
+  async disableUser2fa(code) {
+    if (code !== undefined) {
+      check(code, String);
+    }
     const user = await Meteor.userAsync();
     const userId = user?._id;
 
@@ -495,6 +501,28 @@ Meteor.methods({
       user,
       connection: this.connection,
     });
+
+    if (config.requireCodeToDisable) {
+      // Meteor.userAsync() applies defaultFieldSelector, which may omit services.
+      const current = await Meteor.users.findOneAsync(userId, {
+        fields: { 'services.twoFactorAuthentication': 1 },
+      });
+      if (current && Accounts._check2faEnabled(current)) {
+        const secret = current.services.twoFactorAuthentication.secret;
+        const step = Accounts._verify2faToken(secret, code);
+        if (step === null) {
+          throw await reportInvalidCode(userId, 'disableUser2fa');
+        }
+        if (config.preventReplay) {
+          const consumed = await consumeStep(userId, step, {}, {
+            'services.twoFactorAuthentication.secret': secret,
+          });
+          if (!consumed) {
+            throw await reportInvalidCode(userId, 'disableUser2fa');
+          }
+        }
+      }
+    }
 
     await Meteor.users.updateAsync(
       { _id: userId },

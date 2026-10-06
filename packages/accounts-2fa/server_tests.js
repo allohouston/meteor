@@ -17,6 +17,7 @@ const restore2faConfig = () => {
     preventReplay: true,
     loginTypes: ['password', 'passwordless'],
     allowPlaintextSecrets: true,
+    requireCodeToDisable: false,
   });
 };
 
@@ -43,6 +44,8 @@ const callAs = (userId, name, ...args) => {
     method.apply(invocation, args)
   );
 };
+
+const callAsUser = (userId, name, args) => callAs(userId, name, ...args);
 
 const refuseChange = () =>
   Accounts.validate2faChange(() => {
@@ -625,3 +628,117 @@ Tinytest.addAsync('account - 2fa - configure2fa replaces the rate limit after st
     });
   }
 });
+
+Tinytest.addAsync(
+  'account - 2fa - disabling 2FA requires a current code when configured',
+  async test => {
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const userId = await Accounts.insertUserDoc(
+      {},
+      {
+        emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+        services: {
+          twoFactorAuthentication: { type: 'otp', secret },
+        },
+      }
+    );
+    const { token } = Accounts._generate2faToken(secret);
+
+    try {
+      Accounts.configure2fa({ requireCodeToDisable: true });
+      let refused = null;
+      try {
+        await callAsUser(userId, 'disableUser2fa', []);
+      } catch (error) {
+        refused = error;
+      }
+      test.equal(refused && refused.error, 'invalid-2fa-code');
+      test.isTrue(Accounts._check2faEnabled(await findUserById(userId)));
+
+      await callAsUser(userId, 'disableUser2fa', [token]);
+      test.isFalse(Accounts._check2faEnabled(await findUserById(userId)));
+    } finally {
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'account - 2fa - requireCodeToDisable ignores a positive defaultFieldSelector',
+  async test => {
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const userId = await insertOtpUser(secret);
+    const previous = Accounts._options.defaultFieldSelector;
+    delete Accounts._options.defaultFieldSelector;
+    Accounts.config({ defaultFieldSelector: { username: 1 } });
+
+    try {
+      Accounts.configure2fa({ requireCodeToDisable: true });
+      let refused = null;
+      try {
+        await callAsUser(userId, 'disableUser2fa', []);
+      } catch (error) {
+        refused = error;
+      }
+      test.equal(refused && refused.error, 'invalid-2fa-code');
+      test.isTrue(Accounts._check2faEnabled(await findUserById(userId)));
+    } finally {
+      delete Accounts._options.defaultFieldSelector;
+      if (previous !== undefined) {
+        Accounts._options.defaultFieldSelector = previous;
+      }
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'account - 2fa - a secret that was never activated can be discarded without a code',
+  async test => {
+    const userId = await Accounts.insertUserDoc(
+      {},
+      { emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }] }
+    );
+
+    try {
+      Accounts.configure2fa({ requireCodeToDisable: true });
+      await callAsUser(userId, 'generate2faActivationQrCode', ['Test app']);
+      const pending = await findUserById(userId);
+      test.isTrue(!!pending.services?.twoFactorAuthentication?.secret);
+      test.isFalse(Accounts._check2faEnabled(pending));
+
+      await callAsUser(userId, 'disableUser2fa', []);
+      const user = await findUserById(userId);
+      test.isFalse(!!user.services?.twoFactorAuthentication);
+    } finally {
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'account - 2fa - requireCodeToDisable false keeps disable without a code',
+  async test => {
+    const userId = await Accounts.insertUserDoc(
+      {},
+      {
+        emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+        services: {
+          twoFactorAuthentication: { type: 'otp', secret: 'superSecret' },
+        },
+      }
+    );
+
+    try {
+      Accounts.configure2fa({ requireCodeToDisable: false });
+      await callAsUser(userId, 'disableUser2fa', []);
+      test.isFalse(Accounts._check2faEnabled(await findUserById(userId)));
+    } finally {
+      restore2faConfig();
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);

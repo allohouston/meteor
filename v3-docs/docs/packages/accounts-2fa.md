@@ -96,6 +96,8 @@ To disable 2FA for a user use this method:
 
 To call this function the user must be already logged in.
 
+By default, `Accounts.disableUser2fa(callback)` still works with no code. Set `Accounts.configure2fa({ requireCodeToDisable: true })` to require a current TOTP code before an active authenticator can be removed. That is the recommended setting. A secret that was generated but never activated can still be discarded without a code.
+
 ### Validating 2FA changes {#validating-2fa-changes}
 
 `Accounts.validate2faChange(fn)` runs before a secret is issued, before 2FA is turned on, and before it is turned off. The registration returns `{ stop() }`, which removes the callback.
@@ -140,6 +142,7 @@ Accounts.configure2fa({
   loginTypes: ['password', 'passwordless'], // replaces the default list
   rateLimit: { numRequests: 5, timeInterval: 60_000 },
   allowPlaintextSecrets: true, // set to false after migrating existing secrets
+  requireCodeToDisable: true, // recommended; the default is false
 });
 ```
 

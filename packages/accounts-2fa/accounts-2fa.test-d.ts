@@ -22,7 +22,15 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   loginTypes?: string[];
   rateLimit?: { numRequests: number; timeInterval: number };
   allowPlaintextSecrets?: boolean;
+  requireCodeToDisable?: boolean;
 }>();
+
+Accounts.configure2fa({ requireCodeToDisable: true });
+Accounts.disableUser2fa();
+Accounts.disableUser2fa(() => {});
+Accounts.disableUser2fa("123456", error => {
+  expectTypeOf(error).toEqualTypeOf<Error | undefined>();
+});
 
 expectTypeOf<string>().toMatchTypeOf<TwoFactorStoredSecret>();
 expectTypeOf(Accounts.encryptExisting2faSecrets()).toEqualTypeOf<Promise<number>>();
