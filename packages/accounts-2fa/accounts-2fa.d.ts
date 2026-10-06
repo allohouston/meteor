@@ -14,6 +14,22 @@ export interface TwoFactorConfigureOptions {
   preventReplay?: boolean;
   /** Login attempt types that get replay protection. Replaces the default `['password', 'passwordless']`. */
   loginTypes?: string[];
+  /** Per-user limit for the 2FA methods (default 5 calls per 60 000 ms). Setting it again replaces the rule. */
+  rateLimit?: { numRequests: number; timeInterval: number };
+}
+
+/** Payload passed to `Accounts.on2faChange` callbacks. */
+export interface TwoFactorChangeEvent {
+  event: 'enabled' | 'disabled' | 'reset';
+  userId: string;
+  connection: Meteor.Connection | null;
+}
+
+/** Payload passed to `Accounts.on2faCodeFailure` callbacks. */
+export interface TwoFactorCodeFailure {
+  userId: string;
+  /** `login`, or the name of the 2FA method that rejected the code. */
+  method: string;
 }
 
 /**
@@ -67,6 +83,25 @@ declare module 'meteor/accounts-base' {
     function validate2faChange(
       callback: (attempt: TwoFactorChangeAttempt) => void | Promise<void>
     ): { stop: () => void };
+
+    /** Called after 2FA is enabled, disabled or reset (server only). */
+    function on2faChange(
+      callback: (event: TwoFactorChangeEvent) => void | Promise<void>
+    ): { stop: () => void };
+
+    /** Called when a 2FA code is rejected (server only). */
+    function on2faCodeFailure(
+      callback: (failure: TwoFactorCodeFailure) => void | Promise<void>
+    ): { stop: () => void };
+
+    /**
+     * Remove 2FA from a user without a code (server only).
+     * Not a method and no permission check: the app decides who may call it.
+     */
+    function reset2faForUser(
+      userId: string,
+      options?: { connection?: Meteor.Connection | null }
+    ): Promise<void>;
 
     /** Returns true if the user document has an active `services.twoFactorAuthentication`. */
     function _check2faEnabled(user: Meteor.User): boolean;

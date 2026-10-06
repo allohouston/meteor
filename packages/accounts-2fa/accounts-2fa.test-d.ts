@@ -4,6 +4,8 @@ import { Meteor } from "meteor/meteor";
 import type {
   TwoFactorActivationData,
   TwoFactorChangeAttempt,
+  TwoFactorChangeEvent,
+  TwoFactorCodeFailure,
   TwoFactorConfigureOptions,
 } from "./accounts-2fa";
 
@@ -17,7 +19,24 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   window?: number;
   preventReplay?: boolean;
   loginTypes?: string[];
+  rateLimit?: { numRequests: number; timeInterval: number };
 }>();
+
+Accounts.configure2fa({ rateLimit: { numRequests: 5, timeInterval: 60_000 } });
+
+expectTypeOf<TwoFactorChangeEvent>().toEqualTypeOf<{
+  event: "enabled" | "disabled" | "reset";
+  userId: string;
+  connection: Meteor.Connection | null;
+}>();
+expectTypeOf<TwoFactorCodeFailure>().toEqualTypeOf<{ userId: string; method: string }>();
+expectTypeOf(Accounts.on2faChange(async ({ event }) => {
+  expectTypeOf(event).toEqualTypeOf<"enabled" | "disabled" | "reset">();
+}).stop).toEqualTypeOf<() => void>();
+expectTypeOf(Accounts.on2faCodeFailure(({ userId }) => {
+  expectTypeOf(userId).toBeString();
+}).stop).toEqualTypeOf<() => void>();
+expectTypeOf(Accounts.reset2faForUser("userId")).toEqualTypeOf<Promise<void>>();
 
 // Example from the package guide.
 Accounts.configure2fa({ window: 1 });
@@ -51,6 +70,9 @@ expectTypeOf(Accounts.enableUser2fa).toBeFunction();
 expectTypeOf(Accounts.disableUser2fa).toBeFunction();
 expectTypeOf(Accounts.configure2fa).toBeFunction();
 expectTypeOf(Accounts.validate2faChange).toBeFunction();
+expectTypeOf(Accounts.on2faChange).toBeFunction();
+expectTypeOf(Accounts.on2faCodeFailure).toBeFunction();
+expectTypeOf(Accounts.reset2faForUser).toBeFunction();
 expectTypeOf(Accounts._check2faEnabled).toBeFunction();
 expectTypeOf(Accounts._is2faEnabledForUser).toBeFunction();
 expectTypeOf(Accounts._generate2faToken).toBeFunction();
