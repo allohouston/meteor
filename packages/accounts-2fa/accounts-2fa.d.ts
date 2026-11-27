@@ -6,6 +6,32 @@ export interface TwoFactorActivationData {
   uri: string;
 }
 
+/** Options accepted by `Accounts.configure2fa`. */
+export interface TwoFactorConfigureOptions {
+  /** TOTP steps accepted on each side of the current step (default 10). */
+  window?: number;
+  /** Reject a step at or before the last accepted one (default true). */
+  preventReplay?: boolean;
+  /** Login attempt types that get replay protection. Replaces the default `['password', 'passwordless']`. */
+  loginTypes?: string[];
+  /** Per-user limit for the 2FA methods (default 5 calls per 60 000 ms). Setting it again replaces the rule. */
+  rateLimit?: { numRequests: number; timeInterval: number };
+}
+
+/** Payload passed to `Accounts.on2faChange` callbacks. */
+export interface TwoFactorChangeEvent {
+  event: 'enabled' | 'disabled' | 'reset';
+  userId: string;
+  connection: Meteor.Connection | null;
+}
+
+/** Payload passed to `Accounts.on2faCodeFailure` callbacks. */
+export interface TwoFactorCodeFailure {
+  userId: string;
+  /** `login`, or the name of the 2FA method that rejected the code. */
+  method: string;
+}
+
 /**
  * Payload passed to `Accounts.validate2faChange` callbacks.
  * `stage` is only set for an activation: `setup` when a secret is about to be
@@ -46,6 +72,9 @@ declare module 'meteor/accounts-base' {
      */
     function disableUser2fa(callback?: (error?: Error) => void): void;
 
+    /** Configure TOTP verification and replay protection (server only). */
+    function configure2fa(options: TwoFactorConfigureOptions): void;
+
     /**
      * Refuse a 2FA activation or deactivation (server only).
      * Throw a `Meteor.Error` from the callback to refuse the change and report
@@ -55,14 +84,36 @@ declare module 'meteor/accounts-base' {
       callback: (attempt: TwoFactorChangeAttempt) => void | Promise<void>
     ): { stop: () => void };
 
+    /** Called after 2FA is enabled, disabled or reset (server only). */
+    function on2faChange(
+      callback: (event: TwoFactorChangeEvent) => void | Promise<void>
+    ): { stop: () => void };
+
+    /** Called when a 2FA code is rejected (server only). */
+    function on2faCodeFailure(
+      callback: (failure: TwoFactorCodeFailure) => void | Promise<void>
+    ): { stop: () => void };
+
+    /**
+     * Remove 2FA from a user without a code (server only).
+     * Not a method and no permission check: the app decides who may call it.
+     */
+    function reset2faForUser(
+      userId: string,
+      options?: { connection?: Meteor.Connection | null }
+    ): Promise<void>;
+
     /** Returns true if the user document has an active `services.twoFactorAuthentication`. */
     function _check2faEnabled(user: Meteor.User): boolean;
 
     /** Server-side check against the currently logged-in user. */
     function _is2faEnabledForUser(): Promise<boolean>;
 
-    /** Generate an OTP token for the given secret. */
-    function _generate2faToken(secret: string): { token: string };
+    /** Generate an OTP token for the given secret, at `timestamp` (ms) when given. */
+    function _generate2faToken(secret: string, timestamp?: number): { token: string };
+
+    /** Verify an OTP code and return its time step, or null when invalid (server only). */
+    function _verify2faToken(secret: string, code: string): number | null;
 
     /** Verify an OTP code against a secret (server only). */
     function _isTokenValid(secret: string, code: string): boolean;
