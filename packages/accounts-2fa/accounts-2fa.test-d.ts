@@ -35,7 +35,7 @@ Accounts.disableUser2fa("123456", error => {
   expectTypeOf(error).toEqualTypeOf<Error | undefined>();
 });
 
-expectTypeOf<string>().toMatchTypeOf<TwoFactorStoredSecret>();
+expectTypeOf<TwoFactorStoredSecret>().toEqualTypeOf<string | { [key: string]: unknown }>();
 expectTypeOf(Accounts.encryptExisting2faSecrets()).toEqualTypeOf<Promise<number>>();
 Accounts.configure2fa({ allowPlaintextSecrets: false });
 
