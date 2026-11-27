@@ -19,7 +19,7 @@ expectTypeOf<TwoFactorConfigureOptions>().toEqualTypeOf<{
   allowPlaintextSecrets?: boolean;
 }>();
 
-expectTypeOf<string>().toMatchTypeOf<TwoFactorStoredSecret>();
+expectTypeOf<TwoFactorStoredSecret>().toEqualTypeOf<string | { [key: string]: unknown }>();
 expectTypeOf(Accounts.encryptExisting2faSecrets()).toEqualTypeOf<Promise<number>>();
 Accounts.configure2fa({ allowPlaintextSecrets: false });
 
