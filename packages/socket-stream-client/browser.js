@@ -54,9 +54,14 @@ export class ClientStream extends StreamClientCommon {
   // the floor, and it is up the user of this API to retransmit lost
   // messages on 'reset'
   send(data) {
-    if (this.currentStatus.connected) {
-      this.socket.send(data);
+    if (!this.currentStatus.connected) return;
+    // 0 is CONNECTING (SockJS only has the constant as a static): the one
+    // state where send() throws. A closing socket's own 'close' drives retry.
+    if (this.socket.readyState === 0) {
+      this._lostConnection(new this.ConnectionError("Socket is not open"));
+      return;
     }
+    this.socket.send(data);
   }
 
   // Changes where this connection points
@@ -91,14 +96,19 @@ export class ClientStream extends StreamClientCommon {
   _cleanup(maybeError) {
     this._clearConnectionAndHeartbeatTimers();
     if (this.socket) {
-      this.socket.onmessage = this.socket.onclose = this.socket.onerror = this.socket.onheartbeat = () => {};
+      this.socket.onopen = this.socket.onmessage = this.socket.onclose =
+        this.socket.onerror = this.socket.onheartbeat = () => {};
       this.socket.close();
       this.socket = null;
-    }
 
-    this.forEachCallback('disconnect', callback => {
-      callback(maybeError);
-    });
+      // Only fire disconnect callbacks when there was a socket to close,
+      // matching the node implementation. _cleanup also runs at the top of
+      // every (re)connection attempt, and firing here with no socket sent a
+      // phantom 'disconnect' event to consumers once per retry cycle.
+      this.forEachCallback('disconnect', callback => {
+        callback(maybeError);
+      });
+    }
   }
 
   _clearConnectionAndHeartbeatTimers() {
@@ -118,6 +128,11 @@ export class ClientStream extends StreamClientCommon {
   }
 
   _heartbeat_received() {
+    // The watchdog exists to detect missing SockJS heartbeat frames, which
+    // the server emits every 45s. Native WebSocket transports have no such
+    // frames, so on a quiet connection (e.g. DDP heartbeats disabled) the
+    // timer would be guaranteed to fire and kill a healthy connection.
+    if (this._transport !== 'sockjs') return;
     // If we've already permanently shut down this stream, the timeout is
     // already cleared, and we don't need to set it again.
     if (this._forcedToDisconnect) return;
@@ -159,6 +174,7 @@ export class ClientStream extends StreamClientCommon {
     this._cleanup(); // cleanup the old socket, if there was one.
 
     const transport = __meteor_runtime_config__.DDP_TRANSPORT || 'sockjs';
+    this._transport = transport;
 
     if (transport === 'sockjs') {
       const options = {
@@ -174,7 +190,10 @@ export class ClientStream extends StreamClientCommon {
       this.socket = new WebSocket(toWebsocketUrl(this.rawUrl));
     }
 
-    this.socket.onopen = data => {
+    const socket = this.socket;
+    socket.onopen = () => {
+      // A replaced socket can still deliver its queued 'open'; ignore it.
+      if (this.socket !== socket) return;
       this.lastError = null;
       this._connected();
     };

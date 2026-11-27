@@ -141,6 +141,13 @@ var Session = function (server, version, socket, options) {
     close: function () {
       // Server-initiated close should not be resumable
       self._expectingDisconnect = true;
+      if (self._isClosing && self._pendingRemoveFunction) {
+        // close() already ran and the session is sitting in its resumption
+        // grace period; terminate it now instead of silently doing nothing.
+        Meteor.clearTimeout(self._removeTimeoutHandle);
+        self._pendingRemoveFunction();
+        return;
+      }
       self.close();
     },
     onClose: function (fn) {
@@ -420,8 +427,12 @@ Object.assign(Session.prototype, {
     }
 
     if (self.version !== 'pre1' && msg_in.msg === 'ping') {
-      if (self._respondToPings)
-        self.send({msg: "pong", id: msg_in.id});
+      if (self._respondToPings) {
+        if ('id' in msg_in && typeof msg_in.id !== "string")
+          self.sendError("Malformed ping", msg_in);
+        else
+          self.send({msg: "pong", id: msg_in.id});
+      }
       return;
     }
     if (self.version !== 'pre1' && msg_in.msg === 'pong') {
@@ -462,15 +473,24 @@ Object.assign(Session.prototype, {
           return true;
         });
 
-        if (msg.msg in self.protocol_handlers) {
-          const result = self.protocol_handlers[msg.msg].call(
-            self,
-            msg,
-            unblock
-          );
+        if (
+          typeof msg.msg === "string" &&
+          Object.hasOwn(self.protocol_handlers, msg.msg)
+        ) {
+          let result;
+          try {
+            result = self.protocol_handlers[msg.msg].call(self, msg, unblock);
+          } catch (e) {
+            result = Promise.reject(e);
+          }
 
           if (Meteor._isPromise(result)) {
-            result.finally(() => unblock());
+            // setImmediate runs outside the socket callback; catch rejected handlers here.
+            result
+              .catch((e) => {
+                Meteor._debug("Internal exception while processing message", msg, e);
+              })
+              .finally(() => unblock());
           } else {
             unblock();
           }
@@ -559,6 +579,11 @@ Object.assign(Session.prototype, {
     unsub: function (msg) {
       var self = this;
 
+      if (typeof (msg.id) !== "string") {
+        self.sendError("Malformed unsubscription", msg);
+        return;
+      }
+
       self._stopSubscription(msg.id);
     },
 
@@ -615,6 +640,12 @@ Object.assign(Session.prototype, {
         fence,
       });
 
+      const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+      const instrStartedAt = Instrumentation ? Date.now() : 0;
+      if (Instrumentation) {
+        Instrumentation._emit('method.start', { invocation, name: msg.method, args: msg.params });
+      }
+
       async function finish() {
         await fence.arm();
         unblock();
@@ -666,6 +697,12 @@ Object.assign(Session.prototype, {
         if (result !== undefined) {
           payload.result = result;
         }
+        if (Instrumentation) {
+          Instrumentation._emit('method.end', {
+            invocation, name: msg.method, args: msg.params, result,
+            durationMs: Date.now() - instrStartedAt,
+          });
+        }
         self.send(payload);
       } catch (exception) {
         await finish();
@@ -673,6 +710,12 @@ Object.assign(Session.prototype, {
           exception,
           `while invoking method '${msg.method}'`
         );
+        if (Instrumentation) {
+          Instrumentation._emit('method.error', {
+            invocation, name: msg.method, args: msg.params, error: exception,
+            durationMs: Date.now() - instrStartedAt,
+          });
+        }
         self.send(payload);
       };
     }
@@ -980,6 +1023,13 @@ Object.assign(Subscription.prototype, {
     }
 
     const self = this;
+
+    const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+    if (Instrumentation) {
+      self._instrStartedAt = Date.now();
+      Instrumentation._emit('publication.start', { subscription: self, name: self._name, args: self._params });
+    }
+
     let resultOrThenable = null;
     try {
       resultOrThenable = DDP._CurrentPublicationInvocation.withValue(
@@ -1099,6 +1149,13 @@ Object.assign(Subscription.prototype, {
     if (this._deactivated)
       return;
     this._deactivated = true;
+    const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+    if (Instrumentation && !this._instrErrored) {
+      Instrumentation._emit('publication.stop', {
+        subscription: this, name: this._name, args: this._params,
+        durationMs: this._instrStartedAt ? Date.now() - this._instrStartedAt : undefined,
+      });
+    }
     this._callStopCallbacks().then(() => {
       // Break reference chains to allow GC of the Session and its data.
       // Without this, deactivated subscriptions retain live references
@@ -1160,6 +1217,16 @@ Object.assign(Subscription.prototype, {
     var self = this;
     if (self._isDeactivated())
       return;
+    const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+    if (Instrumentation) {
+      // publication.error is this path's terminal event; flag the imminent
+      // _deactivate() so it doesn't also emit a duplicate publication.stop.
+      self._instrErrored = true;
+      Instrumentation._emit('publication.error', {
+        subscription: self, name: self._name, args: self._params, error,
+        durationMs: self._instrStartedAt ? Date.now() - self._instrStartedAt : undefined,
+      });
+    }
     self._session._stopSubscription(self._subscriptionId, error);
   },
 
@@ -1262,7 +1329,13 @@ Object.assign(Subscription.prototype, {
     if (this._session.server.getPublicationStrategy(collectionName).doAccountingForCollection) {
       // We don't bother to delete sets of things in a collection if the
       // collection is empty.  It could break _removeAllDocuments.
-      this._documents.get(collectionName).delete(id);
+      // The set may not exist: accounting may have been off when the
+      // document was added (publication strategies can change per
+      // collection at runtime), mirroring the null-guard in added().
+      const ids = this._documents.get(collectionName);
+      if (ids != null) {
+        ids.delete(id);
+      }
     }
 
     this._session.removed(this._subscriptionHandle, collectionName, id);
@@ -1283,6 +1356,13 @@ Object.assign(Subscription.prototype, {
     if (!self._ready) {
       self._session.sendReady([self._subscriptionId]);
       self._ready = true;
+      const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+      if (Instrumentation) {
+        Instrumentation._emit('publication.ready', {
+          subscription: self, name: self._name, args: self._params,
+          durationMs: self._instrStartedAt ? Date.now() - self._instrStartedAt : undefined,
+        });
+      }
     }
   }
 });
@@ -1336,10 +1416,10 @@ Server = function (options = {}) {
     debugPrintExceptions: "onMessage callback"
   });
 
-  self.publish_handlers = {};
+  self.publish_handlers = Object.create(null);
   self.universal_publish_handlers = [];
 
-  self.method_handlers = {};
+  self.method_handlers = Object.create(null);
 
   self._publicationStrategies = {};
 
@@ -1498,11 +1578,13 @@ Object.assign(Server.prototype, {
     // the right ID
     // a matching sent/received count
     // was disconnected and hasn't been reconnected to yet.
-    if (existingSession && existingSession.sentCount === msg.receivedCount && existingSession._removeTimeoutHandle) {
+    if (existingSession && existingSession.sentCount === msg.receivedCount &&
+        existingSession._removeTimeoutHandle && !existingSession._expectingDisconnect) {
       Meteor.clearTimeout(existingSession._removeTimeoutHandle);
       existingSession._removeTimeoutHandle = undefined;
       existingSession._pendingRemoveFunction = undefined;
       existingSession._isClosing = false; // Reset so session can be closed again later
+      existingSession._expectingDisconnect = undefined;
       socket._meteorSession = existingSession;
       const messageQueue = existingSession.messageQueue;
       existingSession.messageQueue = undefined;
@@ -1526,10 +1608,12 @@ Object.assign(Server.prototype, {
 
       // Send connected message so client can restart heartbeat and confirm resumption
       existingSession.send({ msg: 'connected', session: existingSession.id });
+      // Flush the messages buffered during the grace period synchronously,
+      // before anything else (e.g. a live observe callback) can send on the
+      // reattached socket — deferring the flush would let newer messages
+      // jump ahead of older buffered ones and break DDP's ordering.
       if (messageQueue) {
-        Meteor.defer(() => {
-          messageQueue.forEach(msg => existingSession.send(msg));
-        });
+        messageQueue.forEach(msg => existingSession.send(msg));
       }
       // Note: onConnectionHook is NOT called on session resume - the connection
       // is considered to be the same logical connection as before.
@@ -1651,6 +1735,11 @@ Object.assign(Server.prototype, {
         session._removeTimeoutHandle = null;
       }
       session._pendingRemoveFunction = null;
+      // Stop buffering: with the queue gone, send() falls through to the
+      // (null) socket and becomes a no-op. Leaving the queue in place would
+      // buffer into a removed session until overflow invoked the
+      // now-nulled _pendingRemoveFunction and threw.
+      session.messageQueue = null;
       self.sessions.delete(session.id);
       callback();
     };
@@ -1784,6 +1873,7 @@ Object.assign(Server.prototype, {
     }
 
     var invocation = new DDPCommon.MethodInvocation({
+      name,
       isSimulation: false,
       userId,
       setUserId,
@@ -1791,7 +1881,13 @@ Object.assign(Server.prototype, {
       randomSeed
     });
 
-    return new Promise((resolve, reject) => {
+    const Instrumentation = Package['instrumentation'] && Package['instrumentation'].Instrumentation;
+    const instrStartedAt = Instrumentation ? Date.now() : 0;
+    if (Instrumentation) {
+      Instrumentation._emit('method.start', { invocation, name, args });
+    }
+
+    const resultPromise = new Promise((resolve, reject) => {
       let result;
       try {
         result = DDP._CurrentMethodInvocation.withValue(invocation, () =>
@@ -1810,6 +1906,24 @@ Object.assign(Server.prototype, {
       }
       result.then(r => resolve(r)).catch(reject);
     }).then(EJSON.clone);
+
+    if (!Instrumentation) {
+      return resultPromise;
+    }
+    return resultPromise.then(
+      (result) => {
+        Instrumentation._emit('method.end', {
+          invocation, name, args, result, durationMs: Date.now() - instrStartedAt,
+        });
+        return result;
+      },
+      (error) => {
+        Instrumentation._emit('method.error', {
+          invocation, name, args, error, durationMs: Date.now() - instrStartedAt,
+        });
+        throw error;
+      }
+    );
   },
 
   _urlForSession: function (sessionId) {

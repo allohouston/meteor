@@ -90,6 +90,150 @@ if (!IS_CHANGESTREAM) {
 }
 
 // ============================================================================
+// CURSOR SUPPORT TESTS
+// ============================================================================
+
+// $where/$near must fall back, like oplog's cursorSupported already does.
+Tinytest.addAsync(
+  'changestream - cursorSupported rejects $where and $near',
+  async function (test) {
+    // Never written to: the fallback's server-side find only evaluates
+    // $where / $near once the namespace exists.
+    const c = makeCollection();
+
+    const supported = async function (expected, selector) {
+      const handle = await c.find(selector).observeChanges({ added() {} });
+      test.equal(isChangeStreamDriver(handle), expected, EJSON.stringify(selector));
+      handle.stop();
+    };
+
+    await supported(true, { foo: 'asdf' });
+    await supported(true, { $and: [{ foo: 'asdf' }, { bar: 'baz' }] });
+
+    await supported(false, { $where: 'xxx' });
+    await supported(false, { $and: [{ foo: 'adsf' }, { $where: 'xxx' }] });
+    await supported(false, { foo: 'fn', $where() { return true; } });
+    await supported(false, { x: { $near: [1, 1] } });
+  }
+);
+
+// Selectors whose local re-match can diverge from MongoDB must fall back too,
+// so a document MongoDB excluded cannot arrive via a live change event
+// (see LocalCollection._liveReMatchDivergence).
+Tinytest.addAsync(
+  'changestream - cursorSupported rejects divergent selectors',
+  async function (test) {
+    const c = makeCollection();
+
+    const supported = async function (expected, selector, options) {
+      const handle = await c
+        .find(selector, options)
+        .observeChanges({ added() {} });
+      test.equal(
+        isChangeStreamDriver(handle),
+        expected,
+        EJSON.stringify({ selector, options })
+      );
+      handle.stop();
+    };
+
+    // Divergent: numeric/negated $type, negated $elemMatch, PCRE-only regex.
+    await supported(false, { foo: { $type: 'double' } });
+    await supported(false, { foo: { $type: 1 } });
+    await supported(false, { foo: { $not: { $type: 4 } } });
+    await supported(false, { foo: { $not: { $elemMatch: { y: 2 } } } });
+    await supported(false, { $nor: [{ foo: { $elemMatch: { y: 2 } } }] });
+    await supported(false, { foo: { $regex: '\\Aabc' } });
+    await supported(false, { foo: /\Aabc/ });
+    // Collation with no faithful Intl.Collator equivalent falls back.
+    await supported(
+      false,
+      { foo: 'abc' },
+      { collation: { locale: 'en', strength: 2, caseLevel: true } }
+    );
+
+    // Safe: plain $elemMatch, ordinary regex and plain collation stay live.
+    await supported(true, { foo: { $elemMatch: { y: 2 } } });
+    await supported(true, { foo: { $regex: '^abc.*z$' } });
+    await supported(true, { foo: /^abc\d+$/i });
+    await supported(
+      true,
+      { foo: 'abc' },
+      { collation: { locale: 'en', strength: 2 } }
+    );
+  }
+);
+
+// Real-document coverage for the divergence fallback checked by cursorSupported
+// above: once Change Streams decline the cursor, a subscriber must only ever see
+// what MongoDB's query returns. `\A` anchors the match to the start of the
+// string in MongoDB's PCRE, but is a literal "A" in a JS RegExp, so Minimongo's
+// re-match diverges from MongoDB. A live driver re-checks later events with
+// Minimongo and would leak a MongoDB-excluded document; the polling fallback
+// cannot, because it re-queries MongoDB.
+Tinytest.addAsync(
+  'changestream - divergent selector polls MongoDB and never leaks excluded docs',
+  async function (test) {
+    const c = makeCollection();
+
+    const events = [];
+    const handle = await c.find({ foo: /\Aabc/ }).observeChanges({
+      added(id, fields) { events.push({ type: 'added', id, fields }); },
+      changed(id, fields) { events.push({ type: 'changed', id, fields }); },
+      removed(id) { events.push({ type: 'removed', id }); },
+    });
+
+    // The divergent selector must decline Change Streams (and oplog) and poll.
+    const driver = handle._multiplexer._observeDriver;
+    test.isFalse(
+      driver._usesChangeStreams === true,
+      'divergent selector must not use change streams'
+    );
+    test.isFalse(
+      driver._usesOplog === true,
+      'divergent selector must not use oplog'
+    );
+
+    try {
+      // MongoDB excludes this ("Aabcxyz" does not start with "abc"), but
+      // Minimongo's /\Aabc/ matches the literal "Aabc" substring, so a live
+      // driver would re-match it locally and leak it.
+      await c.insertAsync({ _id: 'excluded', foo: 'Aabcxyz' });
+      // MongoDB includes this ("abcdef" starts with "abc"); Minimongo would not
+      // match it. It proves the fallback still delivers valid results.
+      await c.insertAsync({ _id: 'allowed', foo: 'abcdef' });
+
+      test.isTrue(
+        await waitFor(() =>
+          events.some(e => e.type === 'added' && e.id === 'allowed'), 5000
+        ),
+        'a MongoDB-matching document must be delivered by the polling fallback'
+      );
+      test.isFalse(
+        events.some(e => e.id === 'excluded'),
+        'a document MongoDB excludes must never reach the observer'
+      );
+
+      // An update that keeps the excluded doc out of MongoDB's result set must
+      // not surface it either, though Minimongo would still "match" it.
+      events.length = 0;
+      await c.updateAsync('excluded', { $set: { foo: 'Aabc-updated' } });
+      await c.updateAsync('allowed', { $set: { marker: 1 } });
+      test.isTrue(
+        await waitFor(() => events.some(e => e.id === 'allowed'), 5000),
+        'updates to a MongoDB-matching document must be delivered'
+      );
+      test.isFalse(
+        events.some(e => e.id === 'excluded'),
+        'updates to an excluded document must stay hidden'
+      );
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+// ============================================================================
 // BASIC CRUD OPERATIONS TESTS
 // ============================================================================
 
@@ -338,6 +482,38 @@ Tinytest.addAsync(
     test.equal(results[0].fields.a, 1);
     test.equal(results[0].fields.c, 3);
     test.isUndefined(results[0].fields.b, 'b should be excluded');
+
+    handle.stop();
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - nested-object projection falls back to polling',
+  async function (test) {
+    const c = makeCollection();
+    const results = [];
+
+    await c.insertAsync({
+      nested: { a: 1, b: 2 },
+      hidden: true
+    });
+
+    const handle = await c.find({}, { fields: { nested: { a: 1 } } }).observeChanges({
+      added: function (id, fields) {
+        results.push({ id, fields });
+      }
+    });
+
+    const driver = handle._multiplexer._observeDriver;
+    test.isFalse(driver._usesChangeStreams === true, 'Unsupported projection should not use Change Streams');
+    test.isFalse(driver._usesOplog === true, 'Unsupported projection should not use oplog');
+
+    await waitFor(() => results.length > 0);
+
+    test.equal(results.length, 1, 'Initial add should be delivered by fallback driver');
+    test.equal(results[0].fields.nested, { a: 1 });
+    test.isUndefined(results[0].fields.nested.b);
+    test.isUndefined(results[0].fields.hidden);
 
     handle.stop();
   }
@@ -1668,6 +1844,295 @@ Tinytest.addAsync(
 );
 
 Tinytest.addAsync(
+  'changestream - primary snapshot ignores older shared-stream events (#14695)',
+  async function (test) {
+    const c = makeCollection();
+    const id = await c.insertAsync({ state: 'fresh' });
+    const events = [];
+    const handle = await c.find({ _id: id, state: 'fresh' }).observeChanges({
+      added(docId) {
+        events.push({ type: 'added', id: docId });
+      },
+      removed(docId) {
+        events.push({ type: 'removed', id: docId });
+      },
+    });
+
+    try {
+      test.equal(events, [{ type: 'added', id }]);
+      events.length = 0;
+
+      const driver = handle._multiplexer._observeDriver;
+      const snapshotBoundary = driver._lastProcessedOperationTime;
+      const Timestamp = snapshotBoundary.constructor;
+
+      // Model events that were already buffered by the shared MongoDB cursor
+      // when this driver joined. The snapshot already contains their effects,
+      // so neither an older event nor the inclusive boundary may replay them.
+      for (const clusterTime of [
+        new Timestamp({ t: snapshotBoundary.t - 1, i: snapshotBoundary.i }),
+        snapshotBoundary,
+      ]) {
+        driver._sharedStream._onChange({
+          operationType: 'update',
+          clusterTime,
+          documentKey: { _id: id },
+          fullDocument: { _id: id, state: 'old' },
+        });
+      }
+
+      await driver._flushPendingWrites();
+      await driver._multiplexer.onFlush(() => {});
+      test.equal(
+        events,
+        [],
+        'events covered by the primary snapshot must not remove its matching document'
+      );
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - primary majority snapshot is causal at cutoff (#14695)',
+  async function (test) {
+    const mongoUrl = new URL(process.env.MONGO_URL);
+    mongoUrl.searchParams.set('readConcernLevel', 'majority');
+    const remote = new MongoInternals.RemoteCollectionDriver(mongoUrl.toString());
+    remote.mongo.client.monitorCommands = true;
+
+    const collectionName = 'changestream_test_' + Random.id();
+    const findCommands = [];
+    const captureFind = (event) => {
+      if (event.commandName === 'find' && event.command.find === collectionName) {
+        findCommands.push(event.command);
+      }
+    };
+    remote.mongo.client.on('commandStarted', captureFind);
+
+    const c = new Mongo.Collection(collectionName, { _driver: remote });
+    const handle = await c.find({ _id: Random.id() }).observeChanges({
+      added() {},
+    });
+
+    try {
+      const driver = handle._multiplexer._observeDriver;
+      const afterClusterTime = findCommands[0]?.readConcern?.afterClusterTime;
+
+      test.isTrue(
+        Boolean(
+          afterClusterTime &&
+          driver._snapshotCutoffOperationTime &&
+          afterClusterTime.equals(driver._snapshotCutoffOperationTime)
+        ),
+        'the majority snapshot must read at or after the cutoff it uses to discard events'
+      );
+    } finally {
+      await handle.stop();
+      remote.mongo.client.off('commandStarted', captureFind);
+      await remote.mongo.close();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - non-causal primary read concerns keep boundary events (#14695)',
+  async function (test) {
+    for (const readConcern of ['available', 'snapshot']) {
+      const c = makeCollection();
+      const id = Random.id();
+      const events = [];
+      const handle = await c.find(
+        { _id: id, state: 'fresh' },
+        { readConcern }
+      ).observeChanges({
+        added(docId) {
+          events.push({ type: 'added', id: docId });
+        },
+      });
+
+      try {
+        const driver = handle._multiplexer._observeDriver;
+        test.isFalse(
+          Boolean(driver._snapshotCutoffOperationTime),
+          `${readConcern} snapshots must not establish a cutoff`
+        );
+        driver._sharedStream._onChange({
+          operationType: 'update',
+          clusterTime: driver._lastProcessedOperationTime,
+          documentKey: { _id: id },
+          fullDocument: { _id: id, state: 'fresh' },
+        });
+
+        await driver._flushPendingWrites();
+        await waitFor(() => events.some(event => event.type === 'added'));
+        test.equal(
+          events,
+          [{ type: 'added', id }],
+          `${readConcern} snapshots must retain events at their boundary`
+        );
+      } finally {
+        await handle.stop();
+      }
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - global available read concern does not create a cutoff (#14695)',
+  async function (test) {
+    const remote = new MongoInternals.RemoteCollectionDriver(process.env.MONGO_URL);
+    remote.mongo.client.monitorCommands = true;
+
+    const admin = remote.mongo.client.db('admin');
+    const originalDefaults = await admin.command({
+      getDefaultRWConcern: 1,
+      inMemory: true,
+    });
+    const collectionName = 'changestream_test_' + Random.id();
+    const findCommands = [];
+    const captureFind = (event) => {
+      if (event.commandName === 'find' && event.command.find === collectionName) {
+        findCommands.push(event.command);
+      }
+    };
+    remote.mongo.client.on('commandStarted', captureFind);
+
+    let handle;
+    try {
+      await admin.command({
+        setDefaultRWConcern: 1,
+        defaultReadConcern: { level: 'available' },
+      });
+
+      const c = new Mongo.Collection(collectionName, { _driver: remote });
+      handle = await c.find({ _id: Random.id() }).observeChanges({
+        added() {},
+      });
+
+      const driver = handle._multiplexer._observeDriver;
+      test.equal(
+        findCommands[0]?.readConcern,
+        { level: 'available' },
+        'the snapshot must retain the effective global read concern'
+      );
+      test.isFalse(
+        Boolean(findCommands[0]?.readConcern?.afterClusterTime),
+        'a global available read concern must not be made causal'
+      );
+      test.isFalse(
+        Boolean(driver._snapshotCutoffOperationTime),
+        'a global available read concern must not establish a cutoff'
+      );
+    } finally {
+      try {
+        await handle?.stop();
+      } finally {
+        remote.mongo.client.off('commandStarted', captureFind);
+        try {
+          await admin.command({
+            setDefaultRWConcern: 1,
+            defaultReadConcern:
+              originalDefaults.defaultReadConcernSource === 'global'
+                ? originalDefaults.defaultReadConcern
+                : {},
+          });
+        } finally {
+          await remote.mongo.close();
+        }
+      }
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - non-primary snapshot keeps boundary events (#14695)',
+  async function (test) {
+    const c = makeCollection();
+    const id = await c.insertAsync({ state: 'fresh' });
+    const events = [];
+    const handle = await c.find(
+      { _id: id, state: 'fresh' },
+      { readPreference: 'secondaryPreferred' }
+    ).observeChanges({
+      added(docId) {
+        events.push({ type: 'added', id: docId });
+      },
+      removed(docId) {
+        events.push({ type: 'removed', id: docId });
+      },
+    });
+
+    try {
+      test.equal(events, [{ type: 'added', id }]);
+      events.length = 0;
+
+      const driver = handle._multiplexer._observeDriver;
+      driver._sharedStream._onChange({
+        operationType: 'update',
+        clusterTime: driver._lastProcessedOperationTime,
+        documentKey: { _id: id },
+        fullDocument: { _id: id, state: 'old' },
+      });
+
+      await driver._flushPendingWrites();
+      await waitFor(() => events.some(event => event.type === 'removed'));
+      test.isTrue(
+        events.some(event => event.type === 'removed' && event.id === id),
+        'a potentially stale non-primary snapshot must still apply its boundary event'
+      );
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - inherited non-primary snapshot keeps boundary events (#14695)',
+  async function (test) {
+    const mongoUrl = new URL(process.env.MONGO_URL);
+    mongoUrl.searchParams.set('readPreference', 'secondaryPreferred');
+    const remote = new MongoInternals.RemoteCollectionDriver(mongoUrl.toString());
+    const c = new Mongo.Collection('changestream_test_' + Random.id(), {
+      _driver: remote,
+    });
+    const id = Random.id();
+    const events = [];
+    const handle = await c.find({ _id: id, state: 'fresh' }).observeChanges({
+      added(docId) {
+        events.push({ type: 'added', id: docId });
+      },
+      removed(docId) {
+        events.push({ type: 'removed', id: docId });
+      },
+    });
+
+    try {
+      test.equal(events, []);
+
+      const driver = handle._multiplexer._observeDriver;
+      driver._sharedStream._onChange({
+        operationType: 'update',
+        clusterTime: driver._lastProcessedOperationTime,
+        documentKey: { _id: id },
+        fullDocument: { _id: id, state: 'fresh' },
+      });
+
+      await driver._flushPendingWrites();
+      await waitFor(() => events.some(event => event.type === 'added'));
+      test.isTrue(
+        events.some(event => event.type === 'added' && event.id === id),
+        'a connection-level non-primary snapshot must still apply its boundary event'
+      );
+    } finally {
+      await handle.stop();
+      await remote.mongo.close();
+    }
+  }
+);
+
+Tinytest.addAsync(
   'changestream - queues writes until ready',
   async function (test) {
     const c = makeCollection();
@@ -2263,6 +2728,911 @@ Tinytest.addAsync(
 );
 
 Tinytest.addAsync(
+  'changestream - a non-resumable history-lost error clears the resume token and recovers instead of looping (#14604)',
+  async function (test) {
+    const c = makeCollection();
+
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+    const streamBefore = shared._changeStream;
+    test.isTrue(!!streamBefore, 'cursor is open before the error');
+
+    // Pretend the stream advanced past some events so a stale resume token is
+    // stored — the state that arms the loop once that token ages out of the
+    // oplog.
+    shared._resumeToken = { _data: 'stale-token' };
+
+    // Count restarts to prove the error triggers exactly one, not a cascade.
+    let restarts = 0;
+    const origRestart = shared._restart.bind(shared);
+    shared._restart = function () {
+      restarts++;
+      return origRestart();
+    };
+
+    let handle2;
+    try {
+      // Emit the exact server error that arms the loop: ChangeStreamHistoryLost.
+      const historyLost = Object.assign(
+        new Error('Resume of change stream was not possible'),
+        { code: 286, codeName: 'ChangeStreamHistoryLost' }
+      );
+      historyLost.errorLabels = ['NonResumableChangeStreamError'];
+      streamBefore.emit('error', historyLost);
+
+      // The token must be dropped so the pending restart falls back to
+      // startAtOperationTime instead of re-sending the dead token forever.
+      await waitFor(() => shared._resumeToken === null, 1000);
+      test.equal(shared._resumeToken, null, 'stale resume token cleared on history loss');
+      test.isTrue(shared._historyLost, 'stream flagged to reconcile drivers after history loss');
+
+      // The single scheduled restart reopens a fresh cursor and settles — the
+      // hallmark of the fix is that it does NOT keep restarting.
+      await waitFor(
+        () => shared._changeStream && shared._changeStream !== streamBefore,
+        3000
+      );
+      test.equal(restarts, 1, 'exactly one restart fires, not a loop');
+      test.isTrue(!!shared._changeStream, 'a fresh cursor is open after recovery');
+      test.isFalse(shared._stopped, 'shared stream stays alive');
+
+      // Reactivity still works after recovery.
+      const results = [];
+      handle2 = await c.find({}).observeChanges({
+        added: (id, fields) => results.push(fields),
+      });
+      await c.insertAsync({ name: 'after-recovery' });
+      await waitFor(() => results.some(r => r.name === 'after-recovery'), 3000);
+      test.isTrue(
+        results.some(r => r.name === 'after-recovery'),
+        'change events flow again after the stream recovers'
+      );
+    } finally {
+      // Restore the patched method and tear down, even if an assertion above threw.
+      delete shared._restart;
+      handle.stop();
+      if (handle2) handle2.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - resync after history loss reconciles inserts, updates and removals missed during the gap (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const keepId = await c.insertAsync({ name: 'keep', v: 1 });
+    const removeId = await c.insertAsync({ name: 'remove-me', v: 1 });
+
+    const events = [];
+    const handle = await c.find({}).observeChanges({
+      added: (id, fields) => events.push({ type: 'added', id, fields }),
+      changed: (id, fields) => events.push({ type: 'changed', id, fields }),
+      removed: (id) => events.push({ type: 'removed', id }),
+    });
+    test.isTrue(isChangeStreamDriver(handle));
+    await waitFor(() => events.length >= 2, 3000);
+    events.length = 0;
+
+    const driver = handle._multiplexer._observeDriver;
+    const shared = driver._sharedStream;
+
+    // Simulate the lost window: detach from the shared stream so live events are
+    // NOT delivered, then mutate the collection out of band via the raw driver.
+    shared._drivers.delete(driver);
+    try {
+      const raw = driver._mongoHandle.rawCollection(c._name);
+      await raw.insertOne({ _id: 'missed-insert', name: 'new', v: 1 });
+      await raw.updateOne({ _id: keepId }, { $set: { v: 2 } });
+      await raw.deleteOne({ _id: removeId });
+
+      // Give any (suppressed) live delivery a chance — nothing should arrive.
+      await new Promise(r => setTimeout(r, 200));
+      test.equal(events.length, 0, 'no events delivered while the driver is detached');
+
+      // Reconcile against the current collection contents.
+      await driver._resyncAfterHistoryLost();
+      await waitFor(() => events.length >= 3, 3000);
+
+      const added = events.filter(e => e.type === 'added');
+      const changed = events.filter(e => e.type === 'changed');
+      const removed = events.filter(e => e.type === 'removed');
+
+      test.isTrue(
+        added.some(e => e.fields.name === 'new'),
+        'a document inserted during the gap is reconciled as added'
+      );
+      test.isTrue(
+        changed.some(e => e.fields.v === 2),
+        'a document updated during the gap is reconciled as changed'
+      );
+      test.equal(removed.length, 1, 'a document removed during the gap is reconciled as removed');
+    } finally {
+      shared._drivers.add(driver);
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - resync fetches full documents so a projected cursor still matches its selector (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    await c.insertAsync({ _id: 'a', group: 'g1', label: 'first' });
+
+    const events = [];
+    // Selector filters on `group`, but the projection ships only `label`. The
+    // resync must fetch the FULL doc so the matcher (which needs `group`) still
+    // accepts it — otherwise the server-projected doc is silently dropped.
+    const handle = await c
+      .find({ group: 'g1' }, { fields: { label: 1 } })
+      .observeChanges({
+        added: (id, fields) => events.push({ type: 'added', id, fields }),
+        changed: (id, fields) => events.push({ type: 'changed', id, fields }),
+        removed: (id) => events.push({ type: 'removed', id }),
+      });
+    test.isTrue(isChangeStreamDriver(handle));
+    await waitFor(() => events.some(e => e.type === 'added' && e.id === 'a'), 3000);
+    events.length = 0;
+
+    const driver = handle._multiplexer._observeDriver;
+    const shared = driver._sharedStream;
+
+    // Simulate the lost window: detach and insert a matching doc out of band.
+    shared._drivers.delete(driver);
+    const raw = driver._mongoHandle.rawCollection(c._name);
+    await raw.insertOne({ _id: 'b', group: 'g1', label: 'second' });
+
+    try {
+      await driver._resyncAfterHistoryLost();
+      await waitFor(() => events.some(e => e.type === 'added' && e.id === 'b'), 3000);
+
+      const addedB = events.find(e => e.type === 'added' && e.id === 'b');
+      test.isTrue(
+        !!addedB,
+        'a matching doc inserted during the gap is reconciled even though the ' +
+        'cursor projects out the selector field'
+      );
+      if (addedB) {
+        test.equal(addedB.fields.label, 'second', 'projected field is delivered');
+        test.isUndefined(addedB.fields.group, 'projected-out field is not delivered');
+      }
+    } finally {
+      shared._drivers.add(driver);
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a resumable (network) error keeps the resume token and does not force a resync (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+    const streamBefore = shared._changeStream;
+    const token = { _data: 'live-token' };
+    shared._resumeToken = token;
+
+    try {
+      // Model the MongoNetworkError the driver re-emits after its OWN internal
+      // resume gave up (e.g. a >30s partition): it exposes hasErrorLabel() but
+      // carries NO ResumableChangeStreamError label and is not code 286/280. It
+      // must NOT clear the still-valid token or force a full-collection resync —
+      // resuming via startAfter will succeed once the topology recovers. Token
+      // handling runs synchronously in the 'error' handler, so assert immediately.
+      const networkErr = Object.assign(new Error('connection reset by peer'), {
+        hasErrorLabel: () => false,
+      });
+      streamBefore.emit('error', networkErr);
+
+      test.equal(shared._resumeToken, token, 'resume token preserved on a resumable network error');
+      test.isFalse(shared._historyLost, 'history-lost not flagged for a resumable error');
+    } finally {
+      // Stop before the restart timer reopens with the preserved token.
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a fatal (280) change-stream error is non-resumable and clears the token (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+    const streamBefore = shared._changeStream;
+    shared._resumeToken = { _data: 'stale-token' };
+
+    try {
+      // ChangeStreamFatalError (280) is genuinely non-resumable: the server
+      // declared the stream unusable, so the token must be dropped and drivers
+      // reconciled — same recovery path as ChangeStreamHistoryLost (286).
+      const fatal = Object.assign(new Error('change stream fatal'), {
+        code: 280, codeName: 'ChangeStreamFatalError',
+      });
+      streamBefore.emit('error', fatal);
+
+      test.equal(shared._resumeToken, null, 'token cleared on a fatal (280) error');
+      test.isTrue(shared._historyLost, 'history-lost flagged on a fatal (280) error');
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - split support selects a usable driver for each server version (#14787)',
+  async test => {
+    const mongo = defaultMongo();
+    const admin = mongo.db.admin;
+    const supported = mongo._supportsChangeStreams;
+    const reasons = mongo._changeStreamServerReasons;
+    try {
+      for (const [version, expected] of [
+        ['6.0.8', false], ['6.0.9', true], ['6.0.10', true],
+        ['7.0.0', true], ['8.0.0', true], ['unknown', false],
+      ]) {
+        mongo._supportsChangeStreams = undefined;
+        mongo.db.admin = function () {
+          const result = admin.call(this);
+          result.serverInfo = async () => ({ version });
+          return result;
+        };
+        const c = makeCollection();
+        const handle = await c.find({}).observeChanges({ added() {} });
+        try {
+          test.equal(isChangeStreamDriver(handle), expected, `server ${version}`);
+        } finally {
+          await handle.stop();
+        }
+      }
+    } finally {
+      mongo.db.admin = admin;
+      mongo._supportsChangeStreams = supported;
+      mongo._changeStreamServerReasons = reasons;
+    }
+  }
+);
+
+// Every test below consumes real server-generated fragments. A batch size of
+// one lets us interrupt delivery between fragments rather than only between
+// complete events in one getMore batch.
+const withLargeChangeStream = async (test, options, run) => {
+  const c = makeCollection();
+  const raw = c.rawCollection();
+  await raw.insertOne({ _id: 'big', big: 'a'.repeat(9 * 1024 * 1024), v: 0 });
+  if (options.preImages) {
+    await c.rawDatabase().command({ collMod: c._name, changeStreamPreAndPostImages: { enabled: true } });
+  }
+
+  const opens = [];
+  const mongo = defaultMongo();
+  const rawCollection = mongo.rawCollection;
+  const watch = raw.watch;
+  mongo.rawCollection = function (name) {
+    const collection = rawCollection.call(this, name);
+    if (name === c._name) {
+      collection.watch = function (pipeline, watchOptions) {
+        opens.push({ ...watchOptions });
+        return watch.call(this, pipeline, { ...watchOptions, batchSize: 1 });
+      };
+    }
+    return collection;
+  };
+  const events = [];
+  let handle;
+  let shared;
+  let driver;
+  try {
+    handle = await c.find({}, { fields: { big: 0 } }).observeChanges({
+      added: (id, fields) => events.push({ type: 'added', id, fields }),
+      changed: (id, fields) => events.push({ type: 'changed', id, fields }),
+      removed: id => events.push({ type: 'removed', id }),
+    });
+    test.isTrue(isChangeStreamDriver(handle));
+    driver = handle._multiplexer._observeDriver;
+    shared = driver._sharedStream;
+    const state = { c, raw, handle, shared, driver, events, opens, fragments: [], delivered: [], resyncs: 0 };
+    const onDriverChange = driver._onChange;
+    driver._onChange = function (change) {
+      state.delivered.push(change);
+      return onDriverChange.call(this, change);
+    };
+    state.dispatch = shared._onChange.bind(shared);
+    shared._onChange = change => {
+      if (change.splitEvent) state.fragments.push(change);
+      return options.onChange
+        ? options.onChange(change, state)
+        : state.dispatch(change);
+    };
+    const resync = shared._resyncDrivers.bind(shared);
+    shared._resyncDrivers = async (...args) => {
+      state.resyncs++;
+      return resync(...args);
+    };
+    await run(state);
+  } finally {
+    if (shared) {
+      delete shared._onChange;
+      delete shared._resyncDrivers;
+    }
+    if (driver) delete driver._onChange;
+    mongo.rawCollection = rawCollection;
+    if (handle) await handle.stop();
+    await raw.drop();
+  }
+};
+
+for (const scenario of [
+  { name: 'post-image and updateDescription', preImages: false, largeUpdate: true, count: 2 },
+  { name: 'pre-image and post-image', preImages: true, largeUpdate: false, count: 2 },
+  { name: 'pre-image, post-image and updateDescription', preImages: true, largeUpdate: true, count: 3 },
+]) {
+  Tinytest.addAsync(
+    `changestream - split delivers ${scenario.name} without resync (#14787)`,
+    async test => {
+      await withLargeChangeStream(test, scenario, async state => {
+        const { c, events, fragments, opens } = state;
+        const modifier = { v: 1 };
+        if (scenario.largeUpdate) modifier.big = 'b'.repeat(9 * 1024 * 1024);
+        await withFence(() => c.updateAsync('big', { $set: modifier }));
+        test.equal(events.filter(e => e.type === 'changed'), [
+          { type: 'changed', id: 'big', fields: { v: 1 } },
+        ], 'the complete update is delivered exactly once before the fence');
+        test.equal(fragments.map(e => e.splitEvent.fragment),
+          scenario.count === 3 ? [1, 2, 3] : [1, 2]);
+        const update = state.delivered.find(e => e.operationType === 'update');
+        test.isTrue(!!update, 'the driver received the reassembled event');
+        if (update) {
+          test.isUndefined(update.splitEvent, 'fragment metadata is not dispatched');
+          test.equal(update._id, fragments[fragments.length - 1]._id, 'the assembled event has the final token');
+          test.equal(update.fullDocument.big.length, 9 * 1024 * 1024);
+          test.equal(update.fullDocument.big[0], scenario.largeUpdate ? 'b' : 'a');
+          test.equal(update.updateDescription.updatedFields.v, 1, 'updateDescription survives assembly');
+          if (scenario.largeUpdate) {
+            test.equal(update.updateDescription.updatedFields.big.length, 9 * 1024 * 1024);
+            test.equal(update.updateDescription.updatedFields.big.at(-1), 'b');
+          }
+          if (scenario.preImages) {
+            test.equal(update.fullDocumentBeforeChange.v, 0, 'the pre-image survives assembly');
+            test.equal(update.fullDocumentBeforeChange.big.length, 9 * 1024 * 1024);
+            test.equal(update.fullDocumentBeforeChange.big[0], 'a');
+          }
+        }
+        test.equal(opens.length, 1, 'the cursor did not restart');
+        test.equal(state.resyncs, 0, 'the observers did not resync');
+        await withFence(() => c.insertAsync({ _id: 'canary', v: 2 }));
+        test.isTrue(events.some(e => e.type === 'added' && e.id === 'canary'),
+          'subsequent ordinary events still flow');
+      });
+    }
+  );
+}
+
+Tinytest.addAsync(
+  'changestream - split keeps write fences parked until the final fragment (#14787)',
+  async test => {
+    let held;
+    let fenceDone = false;
+    await withLargeChangeStream(test, {
+      preImages: true,
+      onChange(change, state) {
+        if (change.splitEvent && change.splitEvent.fragment === change.splitEvent.of) {
+          held = change;
+          return;
+        }
+        state.dispatch(change);
+      },
+    }, async state => {
+      const pending = withFence(() => state.c.updateAsync('big', {
+        $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 },
+      })).then(() => { fenceDone = true; });
+      try {
+        test.isTrue(await waitFor(() => !!held, 5000), 'the last fragment is held');
+        if (!held) return;
+        await new Promise(r => setTimeout(r, 100));
+        test.isFalse(fenceDone, 'an incomplete event cannot release the fence');
+        test.equal(state.events.filter(e => e.type === 'changed'), [],
+          'no partial update reaches an observer');
+        state.dispatch(held);
+        test.isTrue(await waitFor(() => fenceDone, 5000), 'the complete event releases the fence');
+        await pending;
+        test.equal(state.events.filter(e => e.type === 'changed'), [
+          { type: 'changed', id: 'big', fields: { v: 1 } },
+        ]);
+      } finally {
+        if (!fenceDone && held) state.dispatch(held);
+      }
+    });
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - split resumes after each fragment across repeated cursor reconnects (#14787)',
+  async test => {
+    const interrupted = new Set();
+    let discardedStream;
+    await withLargeChangeStream(test, {
+      preImages: true,
+      onChange(change, state) {
+        if (state.shared._changeStream === discardedStream) return;
+        state.dispatch(change);
+        const fragment = change.splitEvent?.fragment;
+        if (fragment && fragment < change.splitEvent.of && !interrupted.has(fragment)) {
+          interrupted.add(fragment);
+          discardedStream = state.shared._changeStream;
+          discardedStream.emit('error', new Error('test connection reset between fragments'));
+        }
+      },
+    }, async state => {
+      let done = false;
+      const pending = withFence(() => state.c.updateAsync('big', {
+        $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 },
+      })).then(() => { done = true; });
+      test.isTrue(await waitFor(() => done, 10000), 'reconnects do not strand the write fence');
+      if (!done) return;
+      await pending;
+      test.equal([...interrupted], [1, 2], 'both fragment boundaries were interrupted');
+      test.equal(state.opens.length, 3, 'both interruptions reopened the cursor');
+      for (let i = 1; i < state.opens.length; i++) {
+        const token = state.fragments.find(e => e.splitEvent.fragment === i)._id;
+        test.equal(state.opens[i].startAfter, token, 'resume from the last received fragment');
+      }
+      test.equal(state.resyncs, 0, 'resumable errors preserve the partial event');
+      test.equal(state.events.filter(e => e.type === 'changed'), [
+        { type: 'changed', id: 'big', fields: { v: 1 } },
+      ], 'the reassembled event is applied once');
+      await withFence(() => state.c.insertAsync({ _id: 'after-reconnect' }));
+      test.isTrue(state.events.some(e => e.id === 'after-reconnect'));
+    });
+  }
+);
+
+for (const code of [280, 286]) {
+  Tinytest.addAsync(
+    `changestream - split discards incomplete events and resyncs after error ${code} (#14787)`,
+    async test => {
+      let discardedStream;
+      let interrupted = false;
+      await withLargeChangeStream(test, {
+        preImages: true,
+        onChange(change, state) {
+          if (state.shared._changeStream === discardedStream) return;
+          state.dispatch(change);
+          if (change.splitEvent?.fragment === 1 && !interrupted) {
+            interrupted = true;
+            discardedStream = state.shared._changeStream;
+            discardedStream.emit('error', Object.assign(new Error('test non-resumable gap'), { code }));
+          }
+        },
+      }, async state => {
+        let done = false;
+        const pending = withFence(() => state.c.updateAsync('big', {
+          $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 },
+        })).then(() => { done = true; });
+        test.isTrue(await waitFor(() => done, 10000), 'resync completes the skipped write fence');
+        if (!done) return;
+        await pending;
+        test.isTrue(interrupted, 'a real split event was interrupted');
+        test.equal(state.resyncs, 1, 'a non-resumable gap still resyncs');
+        test.equal(state.shared._pendingSplitEvent, null, 'incomplete event was discarded');
+        test.equal(state.events.filter(e => e.type === 'changed'), [
+          { type: 'changed', id: 'big', fields: { v: 1 } },
+        ]);
+        await withFence(() => state.c.updateAsync('big', {
+          $set: { big: 'c'.repeat(9 * 1024 * 1024), v: 2 },
+        }));
+        test.equal(state.events.filter(e => e.type === 'changed').map(e => e.fields.v), [1, 2],
+          'the next split event is assembled independently');
+        test.equal(state.resyncs, 1, 'the next split does not need another resync');
+      });
+    }
+  );
+}
+
+
+Tinytest.addAsync(
+  'changestream - split recovers a missing fragment instead of publishing incomplete data (#14787)',
+  async test => {
+    await withLargeChangeStream(test, {
+      preImages: true,
+      onChange(change, state) {
+        if (change.splitEvent?.fragment === 2) return;
+        state.dispatch(change);
+      },
+    }, async state => {
+      let done = false;
+      const pending = withFence(() => state.c.updateAsync('big', {
+        $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 },
+      })).then(() => { done = true; });
+      test.isTrue(await waitFor(() => done, 10000), 'resync releases the skipped write fence');
+      if (!done) return;
+      await pending;
+      test.equal(state.fragments.map(e => e.splitEvent.fragment), [1, 2, 3]);
+      test.equal(state.resyncs, 1, 'a gap takes the non-resumable recovery path');
+      test.equal(state.events.filter(e => e.type === 'changed'), [
+        { type: 'changed', id: 'big', fields: { v: 1 } },
+      ]);
+    });
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - split stops without retaining an incomplete large document (#14787)',
+  async test => {
+    await withLargeChangeStream(test, {
+      preImages: true,
+      onChange(change, state) {
+        if (!change.splitEvent || change.splitEvent.fragment === 1) state.dispatch(change);
+      },
+    }, async state => {
+      await state.c.updateAsync('big', { $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 } });
+      test.isTrue(await waitFor(() => state.fragments.length === 3, 5000));
+      test.isTrue(!!state.shared._pendingSplitEvent, 'a real partial event is buffered');
+      await state.handle.stop();
+      test.equal(state.shared._pendingSplitEvent, null, 'stopping releases the large buffer');
+      test.equal(state.events.filter(e => e.type === 'changed'), []);
+      const snapshot = [];
+      const next = await state.c.find({}, { fields: { big: 0 } }).observeChanges({
+        added: (id, fields) => snapshot.push({ id, fields }),
+      });
+      try {
+        test.equal(snapshot, [{ id: 'big', fields: { v: 1 } }],
+          'a new observer starts independently from the current snapshot');
+      } finally {
+        await next.stop();
+      }
+    });
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - split routes consecutive large events to shared selectors (#14787)',
+  async test => {
+    await withLargeChangeStream(test, {}, async state => {
+      const selected = [];
+      const second = await state.c.find({ v: 2 }, { fields: { big: 0 } }).observeChanges({
+        added: (id, fields) => selected.push({ type: 'added', id, fields }),
+        removed: id => selected.push({ type: 'removed', id }),
+      });
+      try {
+        test.equal(second._multiplexer._observeDriver._sharedStream, state.shared);
+        for (const v of [1, 2, 3]) {
+          await withFence(() => state.c.updateAsync('big', {
+            $set: { big: String(v).repeat(9 * 1024 * 1024), v },
+          }));
+        }
+        test.equal(state.events.filter(e => e.type === 'changed').map(e => e.fields.v), [1, 2, 3]);
+        test.equal(selected, [
+          { type: 'added', id: 'big', fields: { v: 2 } },
+          { type: 'removed', id: 'big' },
+        ]);
+        test.equal(state.fragments.map(e => e.splitEvent.fragment), [1, 2, 1, 2, 1, 2]);
+        test.equal(state.opens.length, 1);
+        test.equal(state.resyncs, 0);
+      } finally {
+        await second.stop();
+      }
+    });
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - split recovery blocks later events until resync holds the write fence (#14787)',
+  async test => {
+    let replayed = false;
+    let done = false;
+    await withLargeChangeStream(test, {
+      preImages: true,
+      onChange(change, state) {
+        if (change.splitEvent) return;
+        if (change.documentKey?._id === 'race-canary') {
+          // Replay real events as a lossy connection: fragment two is missing,
+          // and a later write arrives before the scheduled restart can run.
+          state.dispatch(state.fragments[0]);
+          state.dispatch(state.fragments[2]);
+          state.dispatch(change);
+          test.equal(state.shared._resumeToken, null, 'later events cannot repopulate the dropped token');
+          replayed = true;
+          return;
+        }
+        state.dispatch(change);
+      },
+    }, async state => {
+      const pending = withFence(() => state.c.updateAsync('big', {
+        $set: { big: 'b'.repeat(9 * 1024 * 1024), v: 1 },
+      })).then(() => { done = true; });
+      test.isTrue(await waitFor(() => state.fragments.length === 3, 5000));
+      await state.raw.insertOne({ _id: 'race-canary' });
+      test.isTrue(await waitFor(() => replayed, 5000));
+      test.isFalse(done, 'later events cannot release a skipped write before resync');
+      test.isTrue(await waitFor(() => done, 5000), 'resync eventually releases the fence');
+      if (done) await pending;
+      test.equal(state.resyncs, 1);
+      test.equal(state.events.filter(e => e.type === 'changed'), [
+        { type: 'changed', id: 'big', fields: { v: 1 } },
+      ]);
+    });
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a BSONObjectTooLarge (10334) error is non-resumable and clears the token (#14763)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+    const streamBefore = shared._changeStream;
+    shared._resumeToken = { _data: 'token-before-oversized-event' };
+
+    try {
+      // Resuming via startAfter lands on the same >16MB event and fails again
+      // forever, so it must take the non-resumable path.
+      const tooLarge = Object.assign(new Error('BSONObj size: 18874887 is invalid'), {
+        code: 10334, codeName: 'BSONObjectTooLarge',
+      });
+      streamBefore.emit('error', tooLarge);
+
+      test.equal(shared._resumeToken, null, 'token cleared on BSONObjectTooLarge');
+      test.isTrue(shared._historyLost, 'resync flagged on BSONObjectTooLarge');
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a live event during a history-lost resync does not release the write fence early (#14763)',
+  async function (test) {
+    const c = makeCollection();
+    await c.rawCollection().insertOne({ _id: 'big', v: 0 });
+
+    const log = [];
+    const handle = await c.find({}, { fields: { big: 0 } }).observeChanges({
+      added: id => log.push(`added:${id}`),
+      changed: (id, fields) => log.push(`changed:${id}:${fields.v}`),
+    });
+    test.isTrue(isChangeStreamDriver(handle));
+    await waitFor(() => log.includes('added:big'), 3000);
+
+    // Stand in for ordinary write traffic: the reopened stream delivers another
+    // write before this driver's resync runs, moving the driver past the write
+    // whose event was skipped.
+    const driver = handle._multiplexer._observeDriver;
+    const shared = driver._sharedStream;
+    const onChange = shared._onChange.bind(shared);
+    let lost = false;
+    shared._onChange = change => {
+      if (!lost && change.operationType === 'update' && change.documentKey._id === 'big') {
+        lost = true;
+        shared._changeStream.emit('error', Object.assign(new Error('test history lost'), { code: 286 }));
+        return;
+      }
+      onChange(change);
+    };
+    let resyncs = 0;
+    const origResync = driver._resyncAfterHistoryLost.bind(driver);
+    driver._resyncAfterHistoryLost = async (caughtUpTo) => {
+      resyncs++;
+      await c.rawCollection().insertOne({ _id: 'live-during-resync' });
+      await waitFor(() => log.includes('added:live-during-resync'), 3000);
+      // Give an early fence release time to surface before the resync runs.
+      await new Promise(r => setTimeout(r, 200));
+      return origResync(caughtUpTo);
+    };
+
+    try {
+      const TIMEOUT = Symbol('timeout');
+      const outcome = await Promise.race([
+        withFence(async () => {
+          await c.updateAsync('big', { $set: { v: 1 } });
+        }),
+        new Promise(r => setTimeout(() => r(TIMEOUT), 10000)),
+      ]);
+      test.isTrue(outcome !== TIMEOUT, 'write fence fires');
+      log.push('fence');
+      test.isTrue(lost, 'the update was skipped due to history loss');
+      test.equal(resyncs, 1, 'the history-lost resync ran');
+
+      await waitFor(() => log.includes('changed:big:1'), 3000);
+      const changedAt = log.indexOf('changed:big:1');
+      test.isTrue(
+        changedAt !== -1 && changedAt < log.indexOf('fence'),
+        `the skipped update is reconciled before the fence fires; log=${log.join(',')}`
+      );
+    } finally {
+      delete shared._onChange;
+      delete driver._resyncAfterHistoryLost;
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a resync that throws does not keep holding write fences (#14763)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+
+    const driver = handle._multiplexer._observeDriver;
+    const shared = driver._sharedStream;
+    let resyncCalls = 0;
+    driver._resyncAfterHistoryLost = async () => {
+      resyncCalls++;
+      throw new Error('resync failed');
+    };
+
+    try {
+      const tooLarge = Object.assign(new Error('BSONObj size: 18874887 is invalid'), {
+        code: 10334, codeName: 'BSONObjectTooLarge',
+      });
+      shared._changeStream.emit('error', tooLarge);
+      await waitFor(() => resyncCalls === 1 && !shared._restarting, 5000);
+      test.isFalse(driver._resyncPending, 'the hold is lifted after a failed resync');
+
+      const TIMEOUT = Symbol('timeout');
+      const outcome = await Promise.race([
+        withFence(async () => {
+          await c.insertAsync({ _id: 'after-failed-resync' });
+        }),
+        new Promise(r => setTimeout(() => r(TIMEOUT), 5000)),
+      ]);
+      test.isTrue(outcome !== TIMEOUT, 'later writes still release their fence');
+    } finally {
+      delete driver._resyncAfterHistoryLost;
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a live event applied during a resync is recorded so the resync leaves that id alone (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const keepId = await c.insertAsync({ name: 'keep' });
+
+    const handle = await c.find({}).observeChanges({
+      added: function () { }, changed: function () { }, removed: function () { },
+    });
+    test.isTrue(isChangeStreamDriver(handle));
+    const driver = handle._multiplexer._observeDriver;
+
+    try {
+      // Reproduce the state _resyncAfterHistoryLost sets up (a live-touched set
+      // published for the duration of the reconcile), then apply a live delete of
+      // an id that is in the cache. _flushPendingWrites must record the id AFTER
+      // applying it, so a concurrent resync knows to leave it alone.
+      driver._resyncLiveTouched = new Set();
+      driver._pendingWrites = [{ operationType: 'delete', id: keepId, change: {} }];
+      await driver._flushPendingWrites();
+
+      test.equal(
+        driver._resyncLiveTouched.size, 1,
+        'the live-applied event recorded exactly one live-touched id'
+      );
+    } finally {
+      driver._resyncLiveTouched = null;
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a live event whose apply throws during a resync is NOT recorded as live-touched (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    await c.insertAsync({ name: 'keep' });
+
+    const handle = await c.find({}).observeChanges({
+      added: function () { }, changed: function () { }, removed: function () { },
+    });
+    test.isTrue(isChangeStreamDriver(handle));
+    const driver = handle._multiplexer._observeDriver;
+
+    try {
+      // Recording happens only AFTER a successful apply: an event whose handler
+      // throws must stay UN-recorded so the resync's corrective pass still runs
+      // for that id. (This is the assertion that distinguishes after-apply from
+      // the pre-fix record-before-apply behavior.)
+      driver._handleInsert = () => { throw new Error('boom'); };
+      driver._resyncLiveTouched = new Set();
+      driver._pendingWrites = [{ operationType: 'insert', id: 'x', fullDocument: { _id: 'x' } }];
+      await driver._flushPendingWrites();
+
+      test.equal(
+        driver._resyncLiveTouched.size, 0,
+        'an event whose handler threw is not recorded as live-touched'
+      );
+    } finally {
+      delete driver._handleInsert;
+      driver._resyncLiveTouched = null;
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - restart backoff grows with consecutive failures, de-dupes error+close, and resets on a delivered event (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+
+    try {
+      // Delay grows as base * 2^(failures-1), clamped at 5000ms.
+      shared._restartFailures = 1; test.equal(shared._restartDelay(100), 100);
+      shared._restartFailures = 2; test.equal(shared._restartDelay(100), 200);
+      shared._restartFailures = 4; test.equal(shared._restartDelay(100), 800);
+      shared._restartFailures = 99; test.equal(shared._restartDelay(100), 5000);
+
+      // The driver emits both 'error' and 'close' for one failure; _noteFailure
+      // must count that single cursor failure once, not twice.
+      shared._restartFailures = 0;
+      shared._failureCounted = false;
+      shared._noteFailure();
+      shared._noteFailure();
+      test.equal(shared._restartFailures, 1, 'error+close for one cursor counts a single failure');
+
+      // A delivered event means the reopened stream is healthy: reset the count.
+      shared._onChange({ _id: { _data: 'tok' } });
+      test.equal(shared._restartFailures, 0, 'a delivered event resets the failure count');
+
+      // Reopening a fresh cursor clears the per-cursor failure flag, so the next
+      // cursor's failure is counted again (without this reset, one failure would
+      // arm _failureCounted forever and later failures would stop backing off).
+      shared._noteFailure();
+      test.isTrue(shared._failureCounted, 'failure flag set after counting a failure');
+      await shared._closeStream();
+      await shared._ensureOpen();
+      test.isFalse(shared._failureCounted, 'reopening a fresh cursor clears the per-cursor failure flag');
+    } finally {
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
+  'changestream - a restart requested while one is in flight coalesces instead of running a second reopen (#14604)',
+  async function (test) {
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+    const shared = handle._multiplexer._observeDriver._sharedStream;
+
+    let reopened = false;
+    const origEnsureOpen = shared._ensureOpen;
+    try {
+      // Simulate a restart already in flight. A re-entrant _restart must NOT run a
+      // second close/reopen (which would race two resyncs on the same drivers) —
+      // it records the request so the in-flight restart re-runs once it settles.
+      shared._ensureOpen = function () { reopened = true; return origEnsureOpen.call(this); };
+      shared._restarting = true;
+      shared._restartRequested = false;
+
+      await shared._restart();
+
+      test.isTrue(shared._restartRequested, 're-entrant restart is coalesced into a follow-up request');
+      test.isFalse(reopened, 're-entrant restart does not run a second reopen');
+    } finally {
+      shared._restarting = false;
+      shared._restartRequested = false;
+      shared._ensureOpen = origEnsureOpen;
+      handle.stop();
+    }
+  }
+);
+
+Tinytest.addAsync(
   'changestream - _projectionFn works correctly',
   async function (test) {
     const c = makeCollection();
@@ -2407,6 +3777,13 @@ const isBsonTimestamp = (ts) =>
   ts != null && typeof ts === 'object'
   && typeof ts.t === 'number' && typeof ts.i === 'number';
 
+// Write timestamps are recorded on the fence per (connection, collection) —
+// see fenceWriteTsKey in mongo_common.js. Tests that read or fabricate the
+// annotation map have to build the same composite key.
+const defaultMongo = () => MongoInternals.defaultRemoteCollectionDriver().mongo;
+const fenceKey = (collectionName, connection) =>
+  `${(connection || defaultMongo())._csConnectionId}\u0000${collectionName}`;
+
 Tinytest.addAsync(
   'changestream - insertAsync annotates fence with per-collection ts',
   async function (test) {
@@ -2417,8 +3794,8 @@ Tinytest.addAsync(
       snapshot = f._csTargetTsByCollection && { ...f._csTargetTsByCollection };
     });
     test.isTrue(snapshot !== null, 'fence should have been annotated during the fn');
-    test.isTrue(snapshot[c._name] !== undefined, 'map should contain the collection name key');
-    test.isTrue(isBsonTimestamp(snapshot[c._name]), 'annotation value should be a BSON Timestamp');
+    test.isTrue(snapshot[fenceKey(c._name)] !== undefined, 'map should contain the (connection, collection) key');
+    test.isTrue(isBsonTimestamp(snapshot[fenceKey(c._name)]), 'annotation value should be a BSON Timestamp');
     test.isTrue(fence.fired, 'fence should have fired');
   }
 );
@@ -2434,7 +3811,7 @@ Tinytest.addAsync(
       snapshot = f._csTargetTsByCollection && { ...f._csTargetTsByCollection };
     });
     test.isTrue(snapshot !== null);
-    test.isTrue(isBsonTimestamp(snapshot[c._name]), 'update should annotate with a Timestamp');
+    test.isTrue(isBsonTimestamp(snapshot[fenceKey(c._name)]), 'update should annotate with a Timestamp');
   }
 );
 
@@ -2449,7 +3826,7 @@ Tinytest.addAsync(
       snapshot = f._csTargetTsByCollection && { ...f._csTargetTsByCollection };
     });
     test.isTrue(snapshot !== null);
-    test.isTrue(isBsonTimestamp(snapshot[c._name]), 'remove should annotate with a Timestamp');
+    test.isTrue(isBsonTimestamp(snapshot[fenceKey(c._name)]), 'remove should annotate with a Timestamp');
   }
 );
 
@@ -2465,8 +3842,8 @@ Tinytest.addAsync(
       snapshot = f._csTargetTsByCollection && { ...f._csTargetTsByCollection };
     });
     test.isTrue(snapshot !== null);
-    test.isTrue(isBsonTimestamp(snapshot[a._name]), 'collection A should be annotated');
-    test.isTrue(isBsonTimestamp(snapshot[b._name]), 'collection B should be annotated');
+    test.isTrue(isBsonTimestamp(snapshot[fenceKey(a._name)]), 'collection A should be annotated');
+    test.isTrue(isBsonTimestamp(snapshot[fenceKey(b._name)]), 'collection B should be annotated');
     test.notEqual(a._name, b._name, 'sanity: distinct collection names');
   }
 );
@@ -2484,9 +3861,9 @@ Tinytest.addAsync(
     const snapshotTs = (ts) => (ts == null ? null : { t: ts.t, i: ts.i });
     await withFence(async (f) => {
       await c.insertAsync({ n: 1 });
-      tsFirst = snapshotTs(f._csTargetTsByCollection[c._name]);
+      tsFirst = snapshotTs(f._csTargetTsByCollection[fenceKey(c._name)]);
       await c.insertAsync({ n: 2 });
-      tsFinal = snapshotTs(f._csTargetTsByCollection[c._name]);
+      tsFinal = snapshotTs(f._csTargetTsByCollection[fenceKey(c._name)]);
     });
     test.isTrue(isBsonTimestamp(tsFirst) && isBsonTimestamp(tsFinal));
     const firstLessOrEqual = tsFirst.t < tsFinal.t
@@ -2532,7 +3909,7 @@ Tinytest.addAsync(
     // _waitUntilCaughtUp should hit the 'already-caught-up' early exit
     // and not enqueue a resolver.
     const pastTs = driver._lastProcessedOperationTime;
-    const fakeFence = { _csTargetTsByCollection: { [c._name]: pastTs } };
+    const fakeFence = { _csTargetTsByCollection: { [fenceKey(c._name)]: pastTs } };
 
     const t0 = Date.now();
     await driver._waitUntilCaughtUp(fakeFence);
@@ -2576,7 +3953,7 @@ Tinytest.addAsync(
 
     const farFutureTs = { t: Math.floor(Date.now() / 1000) + 3600, i: 1 };
     const strayFence = {
-      _csTargetTsByCollection: { ['not_' + c._name]: farFutureTs },
+      _csTargetTsByCollection: { [fenceKey('not_' + c._name)]: farFutureTs },
     };
 
     const t0 = Date.now();
@@ -2588,6 +3965,137 @@ Tinytest.addAsync(
       `annotation for another collection should be ignored; elapsed=${elapsed}ms`
     );
     handle.stop();
+  }
+);
+
+Tinytest.addAsync(
+  'changestream- _waitUntilCaughtUp ignores annotation from another connection (#14600)',
+  async function (test) {
+    // Regression for meteor/meteor#14600. An app can hold more than one
+    // MongoConnection — a second MongoInternals.RemoteCollectionDriver onto a
+    // different cluster is the common case — and those connections routinely
+    // use the same collection names. The crossbar notifies every driver
+    // listening on a collection *name*, so a write on the other connection
+    // lands this driver in _waitUntilCaughtUp with a fence that only carries
+    // that connection's timestamp. Its clusterTime comes from a cluster this
+    // driver's stream never observes, so keying on the name alone parked the
+    // wait forever and hung the method that issued the write.
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+    const driver = handle._multiplexer._observeDriver;
+
+    // Same collection name, but recorded against a connection that is not ours.
+    const farFutureTs = { t: Math.floor(Date.now() / 1000) + 3600, i: 1 };
+    const otherConnection = { _csConnectionId: 'mc_other_connection' };
+    const foreignFence = {
+      _csTargetTsByCollection: {
+        [fenceKey(c._name, otherConnection)]: farFutureTs,
+      },
+    };
+
+    // Race the wait: before the fix this never resolves, and awaiting it
+    // directly would hang the whole suite instead of failing.
+    const t0 = Date.now();
+    const raced = await Promise.race([
+      driver._waitUntilCaughtUp(foreignFence).then(() => 'resolved'),
+      new Promise(r => setTimeout(() => r('timed-out'), 2000)),
+    ]);
+    const elapsed = Date.now() - t0;
+
+    test.equal(
+      raced, 'resolved',
+      'a foreign connection\'s annotation must not park this driver\'s wait'
+    );
+    test.isTrue(
+      elapsed < 250,
+      `foreign-connection annotation should be ignored; elapsed=${elapsed}ms`
+    );
+    handle.stop();
+  }
+);
+
+Tinytest.addAsync(
+  'changestream- _waitUntilCaughtUp still waits for its own connection (#14600)',
+  async function (test) {
+    // Guards the other side of the #14600 fix: scoping the lookup by
+    // connection must not turn every wait into a no-op. An annotation recorded
+    // against *our* connection for *our* collection still has to park the wait
+    // until the stream reaches it — releasing early is what #14452 was about
+    // (the fence fires before the change is applied and the client sees
+    // `updated` with no preceding `added`/`changed`/`removed`).
+    const c = makeCollection();
+    const handle = await c.find({}).observeChanges({ added: function () { } });
+    test.isTrue(isChangeStreamDriver(handle));
+    const driver = handle._multiplexer._observeDriver;
+
+    const farFutureTs = { t: Math.floor(Date.now() / 1000) + 3600, i: 1 };
+    const ownFence = {
+      _csTargetTsByCollection: { [fenceKey(c._name)]: farFutureTs },
+    };
+
+    const raced = await Promise.race([
+      driver._waitUntilCaughtUp(ownFence).then(() => 'resolved'),
+      new Promise(r => setTimeout(() => r('still-waiting'), 500)),
+    ]);
+
+    test.equal(
+      raced, 'still-waiting',
+      'a ts for our own connection and collection must still block the wait'
+    );
+
+    // stop() drains the parked resolver so the pending wait above doesn't
+    // outlive the test (see the #14452 test below).
+    handle.stop();
+  }
+);
+
+Tinytest.addAsync(
+  'changestream- a second connection annotates its own fence key (#14600)',
+  async function (test) {
+    // End-to-end counterpart of the two tests above, with a real second
+    // MongoConnection rather than a hand-built fence: writing the same
+    // collection name through each connection must produce two distinct
+    // entries, so neither driver can pick up the other's clusterTime.
+    const collectionName = 'changestream_test_' + Random.id();
+    const primary = defaultMongo();
+    const secondary = new MongoInternals.RemoteCollectionDriver(
+      process.env.MONGO_URL
+    );
+
+    test.notEqual(
+      primary._csConnectionId, secondary.mongo._csConnectionId,
+      'each MongoConnection should get its own id'
+    );
+
+    const primaryCollection = new Mongo.Collection(collectionName);
+    const secondaryCollection = new Mongo.Collection(collectionName, {
+      _driver: secondary,
+      _suppressSameNameError: true,
+    });
+
+    let snapshot = null;
+    await withFence(async (f) => {
+      await primaryCollection.insertAsync({ via: 'primary' });
+      await secondaryCollection.insertAsync({ via: 'secondary' });
+      snapshot = f._csTargetTsByCollection && { ...f._csTargetTsByCollection };
+    });
+
+    test.isTrue(snapshot !== null, 'fence should have been annotated');
+    test.isTrue(
+      isBsonTimestamp(snapshot[fenceKey(collectionName, primary)]),
+      'the primary connection should have its own entry'
+    );
+    test.isTrue(
+      isBsonTimestamp(snapshot[fenceKey(collectionName, secondary.mongo)]),
+      'the secondary connection should have a separate entry'
+    );
+    test.equal(
+      Object.keys(snapshot).length, 2,
+      'same collection name on two connections should not share one entry'
+    );
+
+    await secondary.mongo.close();
   }
 );
 
@@ -2617,7 +4125,7 @@ Tinytest.addAsync(
 
     const Timestamp = driver._lastProcessedOperationTime.constructor;
     const farFutureTs = new Timestamp({ t: Math.floor(Date.now() / 1000) + 3600, i: 1 });
-    const fakeFence = { _csTargetTsByCollection: { [c._name]: farFutureTs } };
+    const fakeFence = { _csTargetTsByCollection: { [fenceKey(c._name)]: farFutureTs } };
 
     // Park the waiter. Do NOT await — it must not resolve until stop().
     let resolved = false;
@@ -2692,13 +4200,14 @@ Tinytest.addAsync(
 );
 
 Tinytest.addAsync(
-  'changestream- insert under fence with observer resolves well under 1s',
+  'changestream- insert under fence with observer resolves under 1s',
   async function (test) {
     // Pre-fix pathology was a hard ~2s wait (2x 1000ms timeout) because
     // _waitUntilCaughtUp asked the server for a ts the stream hadn't seen
     // yet. With the fix the fence carries the exact write ts, the change
     // event carries the same ts, and the wait resolves immediately.
-    // 500ms bound catches a regression without flaking on slow CI.
+    // Allow up to 1s for loaded CI runners (659ms was observed), while still
+    // catching the original ~2s wait.
     const c = makeCollection();
     const added = [];
     const handle = await c.find({}).observeChanges({
@@ -2716,7 +4225,7 @@ Tinytest.addAsync(
     const elapsed = Date.now() - t0;
 
     test.isTrue(
-      elapsed < 500,
+      elapsed < 1000,
       `fenced insert+fire should be fast with the fix; elapsed=${elapsed}ms (pre-fix ~2000ms)`
     );
 

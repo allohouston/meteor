@@ -3,6 +3,7 @@ import util from 'util';
 import assert from 'assert';
 import chalk from 'chalk';
 import semver from 'semver';
+import { fileURLToPath } from 'url';
 
 import files from '../fs/files';
 import utils from '../utils/utils.js';
@@ -250,7 +251,7 @@ outdated platforms`);
 
   // Preparing
 
-  async prepareFromAppBundle(bundlePath, pluginVersions) {
+  async prepareFromAppBundle(bundlePath, pluginVersions, options = {}) {
     assert(bundlePath);
     assert(pluginVersions);
 
@@ -264,7 +265,8 @@ outdated platforms`);
       { mobileServerUrl: this.options.mobileServerUrl,
         cordovaServerPort: this.options.cordovaServerPort,
         settingsFile: this.options.settingsFile,
-        buildMode: this.options.buildMode }
+        buildMode: this.options.buildMode,
+        hmrSecret: options.hmrSecret }
     );
 
     await builder.processControlFile();
@@ -619,14 +621,27 @@ from Cordova project`, async () => {
     }
   }
 
-  // Strips file:// and resolves the path relative to the cordova-build
-  // directory
+  // Resolve absolute file URLs and legacy relative file:// paths.
   resolveLocalPluginPath(pluginPath) {
-    pluginPath = pluginPath.substr("file://".length);
-    if (utils.isPathRelative(pluginPath)) {
-      return files.pathResolve(this.projectContext.projectDir, pluginPath);
-    } else {
-      return pluginPath;
+    const pathWithoutScheme = pluginPath.substr("file://".length);
+    if (utils.isPathRelative(pathWithoutScheme)) {
+      return files.pathResolve(
+        this.projectContext.projectDir,
+        pathWithoutScheme
+      );
+    }
+
+    // Meteor historically treated file:// as a removable prefix. Prefer an
+    // existing raw path so older plugin specs with reserved URL characters
+    // keep working, while still decoding properly encoded absolute URLs.
+    if (files.exists(pathWithoutScheme)) {
+      return pathWithoutScheme;
+    }
+
+    try {
+      return fileURLToPath(pluginPath);
+    } catch {
+      return pathWithoutScheme;
     }
   }
 
