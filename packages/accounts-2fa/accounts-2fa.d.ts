@@ -20,6 +20,8 @@ export interface TwoFactorConfigureOptions {
   allowPlaintextSecrets?: boolean;
   /** Require a current TOTP code to disable an active authenticator (default false). */
   requireCodeToDisable?: boolean;
+  /** Email second factor. Disabled until `email.enabled` is true. */
+  email?: TwoFactorEmailOptions;
 }
 
 /** Payload passed to `Accounts.on2faChange` callbacks. */
@@ -51,6 +53,30 @@ export interface TwoFactorChangeAttempt {
 
 /** A stored TOTP secret: plaintext, or a value sealed by `oauth-encryption`. */
 export type TwoFactorStoredSecret = string | { [key: string]: unknown };
+
+/** Email second factor options. Disabled until `enabled` is true. */
+export interface TwoFactorEmailOptions {
+  enabled?: boolean;
+  /** Let a user who already has TOTP choose email (default false). */
+  offerToOtpUsers?: boolean;
+  /** Send codes only to a verified address (default true). */
+  requireVerified?: boolean;
+  /** Code lifetime in milliseconds (default 600 000). */
+  expirationMs?: number;
+  /** Wrong codes accepted before the code is discarded (default 5). */
+  maxAttempts?: number;
+  /** Minimum delay between two sends, in milliseconds (default 60 000). */
+  resendCooldownMs?: number;
+  /** Server secret for the email-code HMAC. Without it, codes are hashed with SHA-256 and a warning is logged. */
+  hashSecret?: string | null;
+}
+
+/** Payload passed to `Accounts.on2faVerified` and `Accounts.validate2faChallenge` callbacks. */
+export interface TwoFactorFactorEvent {
+  user: Meteor.User;
+  connection: Meteor.Connection | null;
+  method: 'otp' | 'email';
+}
 
 declare module 'meteor/accounts-base' {
   namespace Accounts {
@@ -117,6 +143,39 @@ declare module 'meteor/accounts-base' {
      * Requires `oauth-encryption` with a loaded `oauthSecretKey`. Resolves to the number of users migrated.
      */
     function encryptExisting2faSecrets(): Promise<number>;
+
+    /**
+     * Called after a login that presented a second factor was allowed (server only).
+     * A thrown error is logged and ignored.
+     */
+    function on2faVerified(
+      callback: (event: TwoFactorFactorEvent) => void | Promise<void>
+    ): { stop: () => void };
+
+    /**
+     * Called before an email code is sent (server only).
+     * Throw to skip the send. The login fails with that error.
+     */
+    function validate2faChallenge(
+      callback: (event: TwoFactorFactorEvent) => void | Promise<void>
+    ): { stop: () => void };
+
+    /**
+     * Provide string data sent with every login, such as a trusted-browser token (client only).
+     */
+    function set2faContextProvider(
+      provider: () => Record<string, string> | null | undefined
+    ): void;
+
+    /**
+     * Ask the server to email a second-factor code after checking the password (client only).
+     * The callback receives the `no-2fa-code` error when the message was sent or is on cooldown.
+     */
+    function request2faEmailCode(
+      selector: string | { username: string } | { email: string } | { id: string },
+      password: string,
+      callback?: (error?: Error | Meteor.Error) => void
+    ): void;
 
     /** Returns true if the user document has an active `services.twoFactorAuthentication`. */
     function _check2faEnabled(user: Meteor.User): boolean;

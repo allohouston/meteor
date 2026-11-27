@@ -6,6 +6,7 @@ import * as OTPAuth from 'otpauth';
 import { Random } from 'meteor/random';
 import crypto from 'crypto';
 import { OAuthEncryption } from 'meteor/oauth-encryption';
+import './methods_tests.js';
 
 const findUserById =
   async id => await Meteor.users.findOneAsync(id);
@@ -514,6 +515,86 @@ Tinytest.addAsync('account - 2fa - validate2faChange receives the change payload
     test.equal(payload.connection.id, 'conn');
   });
 });
+
+Tinytest.addAsync('account - 2fa - a secret regenerated during activation stays inactive', async test => {
+  const verifiedSecret = 'JBSWY3DPEHPK3PXP';
+  const newSecret = 'KRUGS4ZANFZSAYJA';
+  const userId = await Accounts.insertUserDoc(
+    {},
+    {
+      emails: [{ address: `${Random.id()}@meteorapp.com`, verified: true }],
+      services: { twoFactorAuthentication: { secret: verifiedSecret } },
+    }
+  );
+  const guard = Accounts.validate2faChange(async ({ type }) => {
+    if (type === 'activation') {
+      await Meteor.users.updateAsync(userId, {
+        $set: { 'services.twoFactorAuthentication': { secret: newSecret } },
+      });
+    }
+  });
+  const method = Meteor.server.method_handlers.enableUser2fa;
+  const invocation = new DDPCommon.MethodInvocation({
+    userId,
+    isSimulation: false,
+    setUserId: () => {},
+    unblock: () => {},
+    connection: { id: 'conn', close() {} },
+    randomSeed: Random.id(),
+  });
+  const { token } = Accounts._generate2faToken(verifiedSecret);
+  try {
+    await DDP._CurrentMethodInvocation.withValue(invocation, () =>
+      method.apply(invocation, [token])
+    );
+    test.fail('the activation should have been refused');
+  } catch (error) {
+    test.equal(error.error, '2fa-secret-changed');
+  } finally {
+    guard.stop();
+  }
+  const user = await Meteor.users.findOneAsync(userId);
+  test.equal(user.services.twoFactorAuthentication.secret, newSecret);
+  test.isFalse(!!user.services.twoFactorAuthentication.type);
+});
+
+Tinytest.addAsync(
+  'account - 2fa - an email factor does not consume a TOTP step',
+  async test => {
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const userId = await insertOtpUser(secret);
+    const { token } = Accounts._generate2faToken(secret);
+    const invocation = {
+      connection: { id: Random.id(), close() {} },
+      setUserId() {},
+    };
+    const previousFactor = Accounts._2faAcceptedFactor;
+    const login = (code, twoFactorMethod) =>
+      Accounts._attemptLogin(
+        invocation,
+        'login',
+        [{ user: { id: userId }, code, ...(twoFactorMethod && { twoFactorMethod }) }],
+        { userId, type: 'password' }
+      );
+
+    try {
+      Accounts._2faAcceptedFactor = () => 'email';
+      const byMethod = await login('000000', 'email');
+      test.equal(byMethod.id, userId);
+      const byFactor = await login('111111');
+      test.equal(byFactor.id, userId);
+      const user = await findUserById(userId);
+      test.isFalse(Number.isInteger(user.services?.twoFactorAuthentication?.lastUsedStep));
+
+      Accounts._2faAcceptedFactor = () => null;
+      const totp = await login(token);
+      test.equal(totp.id, userId);
+    } finally {
+      Accounts._2faAcceptedFactor = previousFactor;
+      await Accounts.users.removeAsync(userId);
+    }
+  }
+);
 
 Tinytest.addAsync('account - 2fa - reset2faForUser clears 2FA and notifies hooks', async test => {
   const userId = await Accounts.insertUserDoc(

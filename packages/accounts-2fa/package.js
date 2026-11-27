@@ -1,5 +1,5 @@
 Package.describe({
-  version: "3.2.0",
+  version: "3.1.1",
   summary:
     "Package used to enable two factor authentication through OTP protocol",
 });
@@ -18,10 +18,11 @@ Package.onUse(function (api) {
   api.use("ecmascript");
   api.use(["check", "ejson"], "server");
   api.use("ddp-rate-limiter", "server");
+  api.use("email", "server");
   api.use("oauth-encryption", "server", { weak: true });
 
   api.addFiles(["2fa-client.js"], "client");
-  api.addFiles(["2fa-server.js"], "server");
+  api.addFiles(["2fa-email.js", "2fa-methods.js", "2fa-server.js"], "server");
 
   api.types("accounts-2fa.d.ts");
 });
@@ -30,8 +31,10 @@ Package.onTest(function (api) {
   api.use([
     "accounts-base",
     "accounts-password",
+    "email",
     "ddp-client",
     "ddp-common",
+    "check",
     "ecmascript",
     "tinytest",
     "random",

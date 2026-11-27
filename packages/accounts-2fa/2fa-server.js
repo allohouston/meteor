@@ -86,8 +86,8 @@ const generateActivationData = ({ issuer, label }) => {
 };
 
 /**
- * @summary Configure TOTP verification and replay protection.
- * Defaults match previous releases, except that a code cannot be reused.
+ * @summary Configure TOTP verification, replay protection and the second factors offered at login.
+ * Call this at startup. Defaults match previous releases, except that a code cannot be reused.
  * @locus Server
  * @param {Object} options
  * @param {Number} [options.window=10] TOTP steps accepted on each side of the current step.
@@ -98,6 +98,14 @@ const generateActivationData = ({ issuer, label }) => {
  * @param {Number} options.rateLimit.timeInterval Interval in milliseconds.
  * @param {Boolean} [options.allowPlaintextSecrets=true] Accept secrets stored before encryption was enabled.
  * @param {Boolean} [options.requireCodeToDisable=false] Require a valid TOTP code to disable an active authenticator.
+ * @param {Object} [options.email] Email second factor. Disabled until `enabled` is set.
+ * @param {Boolean} [options.email.enabled]
+ * @param {Boolean} [options.email.offerToOtpUsers=false] Let a user who already has TOTP choose email. Off until the app opts in.
+ * @param {Boolean} [options.email.requireVerified=true]
+ * @param {Number} [options.email.expirationMs=600000]
+ * @param {Number} [options.email.maxAttempts=5]
+ * @param {Number} [options.email.resendCooldownMs=60000]
+ * @param {String} [options.email.hashSecret] Server secret for the email-code HMAC. Without it, codes are hashed with SHA-256 and a warning is logged.
  */
 Accounts.configure2fa = options => {
   check(options, {
@@ -114,14 +122,28 @@ Accounts.configure2fa = options => {
     }),
     allowPlaintextSecrets: Match.Optional(Boolean),
     requireCodeToDisable: Match.Optional(Boolean),
+    email: Match.Optional({
+      enabled: Match.Optional(Boolean),
+      expirationMs: Match.Optional(Match.Integer),
+      maxAttempts: Match.Optional(Match.Integer),
+      resendCooldownMs: Match.Optional(Match.Integer),
+      requireVerified: Match.Optional(Boolean),
+      offerToOtpUsers: Match.Optional(Boolean),
+      hashSecret: Match.Optional(Match.OneOf(String, null, undefined)),
+    }),
   });
 
-  const rateLimitChanged = options.rateLimit !== undefined;
+  const { email, ...totpOptions } = options;
+  if (email) {
+    Accounts._configure2faEmail(email);
+  }
+
+  const rateLimitChanged = totpOptions.rateLimit !== undefined;
   config = {
     ...config,
-    ...options,
-    rateLimit: options.rateLimit
-      ? { ...options.rateLimit }
+    ...totpOptions,
+    rateLimit: totpOptions.rateLimit
+      ? { ...totpOptions.rateLimit }
       : config.rateLimit,
   };
   if (rateLimitChanged && rateLimitRuleId) {
@@ -354,8 +376,16 @@ Accounts.validateLoginAttempt(async attempt => {
   if (!attempt.user || !config.loginTypes.includes(attempt.type)) {
     return true;
   }
-  const code = attempt.methodArguments?.[0]?.code;
+  const loginOptions = attempt.methodArguments?.[0] || {};
+  const code = loginOptions.code;
   if (typeof code !== 'string') {
+    return true;
+  }
+  // An email code is not a TOTP step.
+  if (
+    loginOptions.twoFactorMethod === 'email' ||
+    Accounts._2faAcceptedFactor?.(attempt.user._id, attempt.connection) === 'email'
+  ) {
     return true;
   }
   // attempt.user is loaded with defaultFieldSelector, which may omit services.
