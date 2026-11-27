@@ -3,7 +3,7 @@ import { wrap, OptimisticWrapperFunction, dep } from "optimism";
 import ignore from "ignore";
 import { Profile } from "../tool-env/profile";
 import { watch, SafeWatcher } from "./safe-watcher";
-import { sha1 } from "./watch";
+import { sha1, readFile as readFileOrNull } from "./watch";
 import {
   pathSep,
   pathBasename,
@@ -339,38 +339,59 @@ makeOptimistic("readJsonOrNull", (
   }
 });
 
-// Registry of .meteorignore patterns keyed by directory path.
-// This is populated as .meteorignore files are read during the build process.
-const meteorIgnoreRegistry = new Map<string, ReturnType<typeof ignore>>();
+export function optimisticReadMeteorIgnore(
+  meteorIgnorePath: string | null,
+  customMeteorIgnore?: string,
+  rootMeteorIgnore?: string
+) {
+  // Another directory can trigger a rebuild before this file's watcher fires.
+  // Read listed ignore files fresh; a null path needs no filesystem access.
+  const contents = meteorIgnorePath !== null &&
+      statOrNull(meteorIgnorePath)?.isFile()
+    ? readFileOrNull(meteorIgnorePath)?.toString("utf8") ?? null
+    : null;
 
-export const optimisticReadMeteorIgnore = wrap((dir: string) => {
-  const meteorIgnorePath = pathJoin(dir, ".meteorignore");
-  const meteorIgnoreStat = optimisticStatOrNull(meteorIgnorePath);
+  return optimisticParseMeteorIgnore(contents, customMeteorIgnore, rootMeteorIgnore);
+}
 
-  let ignoreConfig = null;
-  if (meteorIgnoreStat &&
-      meteorIgnoreStat.isFile()) {
-    ignoreConfig = ignore().add(
-        optimisticReadFile(meteorIgnorePath).toString("utf8")
-    );
-  }
+const optimisticParseMeteorIgnore = wrap((
+  contents: string | null,
+  customMeteorIgnore?: string,
+  rootMeteorIgnore?: string
+) => {
+  let ignoreConfig = contents === null ? null : ignore().add(contents);
 
-  const customMeteorIgnore = process.env.METEOR_IGNORE;
-  if (customMeteorIgnore != null) {
-    ignoreConfig = ignoreConfig || ignore();
-    const allCustomMeteorIgnores = customMeteorIgnore.trim().split(/\s+/);
-    ignoreConfig = ignoreConfig.add(allCustomMeteorIgnores);
-  }
-
-  // Update the registry with this directory's ignore config
-  if (ignoreConfig) {
-    meteorIgnoreRegistry.set(dir, ignoreConfig);
-  } else {
-    meteorIgnoreRegistry.delete(dir);
+  // Explicit arguments also keep environment changes in the cache key.
+  for (const patterns of [customMeteorIgnore, rootMeteorIgnore]) {
+    if (patterns != null) {
+      ignoreConfig = ignoreConfig || ignore();
+      ignoreConfig = ignoreConfig.add(patterns.trim().split(/\s+/));
+    }
   }
 
   return ignoreConfig;
 });
+
+// Registry of .meteorignore patterns keyed by directory path.
+// This is populated as .meteorignore files are read during the build process.
+const meteorIgnoreRegistry = new Map<string, ReturnType<typeof ignore>>();
+
+/**
+ * Record the ignore rules read for a directory, or forget them when there are none.
+ *
+ * @param absDir - Absolute path of the directory
+ * @param ignoreConfig - Rules returned by optimisticReadMeteorIgnore
+ */
+export function setMeteorIgnoreForDir(
+  absDir: string,
+  ignoreConfig: ReturnType<typeof ignore> | null
+) {
+  if (ignoreConfig) {
+    meteorIgnoreRegistry.set(absDir, ignoreConfig);
+  } else {
+    meteorIgnoreRegistry.delete(absDir);
+  }
+}
 
 /**
  * Check if a path should be ignored based on .meteorignore patterns.

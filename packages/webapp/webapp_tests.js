@@ -3,6 +3,7 @@ import { WebApp, WebAppInternals } from './webapp_server';
 const url = require("url");
 const crypto = require("crypto");
 const http = require("http");
+const net = require("net");
 const streamToString = require("stream-to-string");
 import { isModern } from "meteor/modern-browsers";
 
@@ -318,6 +319,42 @@ Tinytest.addAsync(
   }
 );
 
+// Regression test for #13489: mutating Meteor.settings.public (which mutates
+// __meteor_runtime_config__.PUBLIC_SETTINGS) after the boilerplate has been
+// generated and cached at startup should still be reflected for clients that
+// connect afterwards.
+Tinytest.addAsync(
+  "webapp - runtime updates to public settings reach new clients",
+  async function (test) {
+    const original = __meteor_runtime_config__.PUBLIC_SETTINGS;
+    __meteor_runtime_config__.PUBLIC_SETTINGS = {
+      ...(original || {}),
+      webappRuntimePublicSetting: "set-after-startup",
+    };
+
+    try {
+      const req = new http.IncomingMessage();
+      req.url = "http://example.com";
+      req.browser = { name: "headless" };
+
+      const { stream } = await WebAppInternals.getBoilerplate(
+        req,
+        "web.browser"
+      );
+      const html = await streamToString(stream);
+
+      test.isTrue(
+        html.indexOf("webappRuntimePublicSetting") >= 0 &&
+          html.indexOf("set-after-startup") >= 0,
+        "boilerplate served to a new client should include public settings " +
+          "that were set after startup"
+      );
+    } finally {
+      __meteor_runtime_config__.PUBLIC_SETTINGS = original;
+    }
+  }
+);
+
 // Support 'named pipes' (strings) as ports for support of Windows Server /
 // Azure deployments
 Tinytest.add(
@@ -536,6 +573,54 @@ Tinytest.addAsync(
   }
 );
 
+Tinytest.addAsync(
+  'webapp - skipCompressionWithContentLength setting keeps Content-Length',
+  async function (test) {
+    const arch = 'web.browser';
+    const staticPath = '/skip-compression-test.js';
+    const original =
+      Meteor.settings.packages?.webapp?.skipCompressionWithContentLength;
+
+    if (!Meteor.settings.packages) Meteor.settings.packages = {};
+    if (!Meteor.settings.packages.webapp) Meteor.settings.packages.webapp = {};
+
+    // Large enough to be past the compression module's default threshold.
+    const content = 'console.log("skip-compression-test");\n'.repeat(80);
+    WebAppInternals.staticFilesByArch[arch][staticPath] = {
+      content,
+      absolutePath: '/tmp/mock-skip-compression.js',
+      cacheable: true,
+      hash: 'skip-compression-hash',
+      type: 'js',
+    };
+
+    const reqOpts = { headers: { 'Accept-Encoding': 'gzip' } };
+    try {
+      Meteor.settings.packages.webapp.skipCompressionWithContentLength = false;
+      const off = await asyncGet(Meteor.absoluteUrl(staticPath), reqOpts);
+      test.equal(
+        (off.headers['content-encoding'] || '').toLowerCase(),
+        'gzip',
+        'should compress (and drop Content-Length) when the setting is off'
+      );
+
+      Meteor.settings.packages.webapp.skipCompressionWithContentLength = true;
+      const on = await asyncGet(Meteor.absoluteUrl(staticPath), reqOpts);
+      test.isFalse(
+        (on.headers['content-encoding'] || '').toLowerCase().includes('gzip'),
+        'should not compress when the setting is on'
+      );
+      test.isTrue(
+        !!on.headers['content-length'],
+        'Content-Length should be preserved when the setting is on'
+      );
+    } finally {
+      delete WebAppInternals.staticFilesByArch[arch][staticPath];
+      Meteor.settings.packages.webapp.skipCompressionWithContentLength = original;
+    }
+  }
+);
+
 // Verification: Ensure that a URL containing a specific hash serves the exact same
 // content and headers to all browsers (Modern vs Legacy).
 // This proves that removing 'Vary: User-Agent' is safe because the file content
@@ -585,5 +670,44 @@ Tinytest.addAsync(
     } finally {
       delete WebAppInternals.staticFilesByArch[arch][hashedPath];
     }
+  }
+);
+
+// Node's HTTP client cannot send a malformed request, so write raw bytes and
+// collect everything the server sends before it closes the socket.
+function rawHttpExchange(request) {
+  const { port } = WebApp.httpServer.address();
+  return new Promise((resolve) => {
+    const socket = net.connect(port, "127.0.0.1");
+    let reply = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      reply += chunk;
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => resolve(reply));
+    socket.setTimeout(5000, () => socket.destroy());
+    socket.write(request);
+  });
+}
+
+Tinytest.addAsync(
+  "webapp - parse errors - a malformed request line gets 400",
+  async function (test) {
+    const reply = await rawHttpExchange(
+      "FOO@ / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    test.matches(reply, /^HTTP\/1\.1 400 /);
+  }
+);
+
+Tinytest.addAsync(
+  "webapp - parse errors - oversized headers get 431",
+  async function (test) {
+    const reply = await rawHttpExchange(
+      "GET / HTTP/1.1\r\nHost: localhost\r\n" +
+        `X-Oversized: ${"a".repeat(http.maxHeaderSize)}\r\n\r\n`
+    );
+    test.matches(reply, /^HTTP\/1\.1 431 /);
   }
 );
